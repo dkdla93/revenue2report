@@ -1,299 +1,183 @@
 import streamlit as st
-import json
-import datetime
 import re
 import time
 import io
 import zipfile
-import requests as req
-
-import gspread
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-
-# gspread-formatting
-from gspread_formatting import (
-    format_cell_range,
-    CellFormat,
-    Color,
-    TextFormat,
-    set_column_width,
-    set_row_height
-)
-
-# (기존) collections
-from collections import defaultdict
-
-# (신규) openpyxl
 import openpyxl
 from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from collections import defaultdict
+import pandas as pd
 
 
-# ========== [1] 인증/초기설정 =============
-SCOPES = [
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
+def main():
+    st.title("아티스트 음원 정산 보고서 자동 생성기 (Excel 기반)")
 
-def get_credentials_from_secrets(which: str = "A") -> Credentials:
-    """
-    which="A"  -> st.secrets["google_service_account_a"] 사용
-    which="B"  -> st.secrets["google_service_account_b"] 사용
-    """
-    if which.upper() == "A":
-        service_account_info = st.secrets["google_service_account_a"]
-    else:
-        service_account_info = st.secrets["google_service_account_b"]
+    # 1) 섹션1: 보고서 생성(파일 업로드 + 진행기간/발행일 입력 등)
+    section_one_report_input()
 
-    credentials = Credentials.from_service_account_info(
-        service_account_info,
-        scopes=SCOPES
-    )
-    return credentials
+    st.divider()
+
+    # 2) 섹션2: 검증 결과 표시
+    section_two_verification()
+
+    st.divider()
+
+    # 3) 섹션3: 결과 ZIP 다운로드
+    section_three_download_zip()
+
+    st.divider()
+    st.info("끝")
 
 
-# ----------------------------------------------------------------
-# 웹 UI 섹션1~3 부분
-# ----------------------------------------------------------------
+# ------------------------------------------
+# 1) 섹션1: 보고서 생성(파일 업로드 + 진행기간/발행일 입력)
+# ------------------------------------------
 def section_one_report_input():
-    """
-    1번 섹션: 진행기간(YYYYMM), 보고서 발행 날짜 입력 + 보고서 생성 버튼
-    """
-    st.subheader("1) 정산 보고서 정보 입력 항목")
+    st.subheader("1) 정산 보고서 생성")
 
-    # (A) 진행률 바 / 현재 처리중 아티스트 표시용 placeholder
-    progress_bar = st.empty()
-    artist_placeholder = st.empty()
-
-    # session_state에서 기본값 불러오기 (없으면 "")
+    # session_state에서 기본값 불러오기
     default_ym = st.session_state.get("ym", "")
     default_report_date = st.session_state.get("report_date", "")
 
-    # 1. 입력 필드
+    # 사용자 입력
     ym = st.text_input("진행기간(YYYYMM)", default_ym)
     report_date = st.text_input("보고서 발행 날짜 (YYYY-MM-DD)", default_report_date)
 
-    # 2. 생성 버튼
-    if st.button("정산 보고서 생성 시작"):
-        # A 계정 인증
-        creds_a = get_credentials_from_secrets("A")
-        gc_a = gspread.authorize(creds_a)
-        drive_svc_a = build("drive", "v3", credentials=creds_a)
-        sheet_svc_a = build("sheets", "v4", credentials=creds_a)
+    # 엑셀 업로드 (두 개)
+    uploaded_song_cost = st.file_uploader("input_song cost.xlsx 업로드", type=["xlsx"])
+    uploaded_online_revenue = st.file_uploader("input_online revenue.xlsx 업로드", type=["xlsx"])
 
-        # 유효성 체크
+    # 생성 버튼
+    if st.button("정산 보고서 생성 시작"):
         if not re.match(r'^\d{6}$', ym):
-            st.error("진행기간은 YYYYMM 6자리로 입력해야 합니다.")
+            st.error("진행기간은 YYYYMM 6자리로 입력하세요.")
             return
         if not report_date:
             st.error("보고서 발행 날짜를 입력하세요.")
+            return
+        if not uploaded_song_cost or not uploaded_online_revenue:
+            st.error("두 개의 엑셀 파일을 모두 업로드해야 합니다.")
             return
 
         # session_state에 입력값 저장
         st.session_state["ym"] = ym
         st.session_state["report_date"] = report_date
 
-        # 실제 generate_report() 호출
+        # 검증용 dict
         check_dict = {
             "song_artists": [],
             "revenue_artists": [],
-            "artist_compare_result": {}
+            "artist_compare_result": {},
+            "verification_summary": {
+                "total_errors": 0,
+                "artist_error_list": []
+            },
+            "details_verification": {
+                "정산서": [],
+                "세부매출": []
+            }
         }
 
-        # 실제 generate_report(...) 호출 (A계정으로)
-        out_file_id = generate_report(
-            ym, report_date, check_dict,
-            gc=gc_a, 
-            drive_svc=drive_svc_a, 
-            sheet_svc=sheet_svc_a,
-            progress_bar=progress_bar,
-            artist_placeholder=artist_placeholder
+        # 실제 보고서 생성
+        zip_data = generate_report_excel(
+            ym, report_date,
+            uploaded_song_cost,
+            uploaded_online_revenue,
+            check_dict
         )
-        st.session_state["report_done"] = True
-        st.session_state["report_file_id"] = out_file_id
-        st.success(f"보고서 생성 완료! file_id={out_file_id}")
 
-        if out_file_id:
-            artist_placeholder.success("모든 아티스트 정산 보고서 생성 완료!")
-            time.sleep(1)
-            artist_placeholder.empty()
-            progress_bar.empty()
-
+        if zip_data is not None:
+            st.success("정산 보고서 생성 완료! 아래 섹션에서 ZIP 다운로드 가능")
+            # st.session_state에 기록
             st.session_state["report_done"] = True
-            st.session_state["report_file_id"] = out_file_id
+            st.session_state["zip_data"] = zip_data
             st.session_state["check_dict"] = check_dict
+        else:
+            st.error("보고서 생성 중 오류가 발생했습니다.")
 
 
-def section_two_sheet_link_and_verification():
-    """
-    2번 섹션: 구글시트 링크 + 검증 결과 표시 (탭 2개)
-    - report_done == True 인 경우에만 표시
-    """
-    if "report_done" in st.session_state and st.session_state["report_done"]:
-        st.subheader("2) 정산 보고서 시트링크 및 검증")
+# ------------------------------------------
+# 2) 섹션2: 검증 결과 표시
+# ------------------------------------------
+def section_two_verification():
+    if st.session_state.get("report_done", False):
+        st.subheader("2) 검증 결과")
 
-        # 탭 생성
-        tab1, tab2 = st.tabs(["보고서 링크 / 요약", "세부 검증 내용"])
+        cd = st.session_state.get("check_dict", {})
+        if not cd:
+            st.info("검증 데이터가 없습니다.")
+            return
 
-        # -------------------------
-        # (A) 첫 번째 탭: 링크/요약
-        # -------------------------
+        # 탭 2개
+        tab1, tab2 = st.tabs(["검증 요약", "세부 검증 내용"])
+
         with tab1:
-            out_file_id = st.session_state.get("report_file_id", "")
-            if out_file_id:
-                gsheet_url = f"https://docs.google.com/spreadsheets/d/{out_file_id}/edit"
-                st.write(f"**생성된 구글시트 링크:** {gsheet_url}")
+            ar = cd.get("artist_compare_result", {})
+            st.write("**아티스트 목록 비교**")
+            st.write(f"- Song cost 아티스트 수 = {ar.get('song_count')}")
+            st.write(f"- Revenue 아티스트 수 = {ar.get('revenue_count')}")
+            st.write(f"- 공통 아티스트 수 = {ar.get('common_count')}")
+            if ar.get("missing_in_song"):
+                st.warning(f"Song에 없고 Revenue에만 있는 아티스트: {ar['missing_in_song']}")
+            if ar.get("missing_in_revenue"):
+                st.warning(f"Revenue에 없고 Song에만 있는 아티스트: {ar['missing_in_revenue']}")
 
-            cd = st.session_state.get("check_dict", {})
-            if cd:
-                ar = cd.get("artist_compare_result", {})
-                st.write("**검증 요약**")
-                if ar:
-                    st.write(f"- Song cost 아티스트 수 = {ar.get('song_count')}")
-                    st.write(f"- Revenue 아티스트 수 = {ar.get('revenue_count')}")
-                    st.write(f"- 공통 아티스트 수 = {ar.get('common_count')}")
-                    if ar.get("missing_in_song"):
-                        st.warning(f"Song에 없고 Revenue에만 있는: {ar['missing_in_song']}")
-                    if ar.get("missing_in_revenue"):
-                        st.warning(f"Revenue에 없고 Song에만 있는: {ar['missing_in_revenue']}")
-                    
-                    ver_sum = cd.get("verification_summary", {})
-                    if not ver_sum:
-                        st.info("추가 검증 데이터가 없습니다.")
-                    else:
-                        total_err = ver_sum.get("total_errors", 0)
-                        artists_err = ver_sum.get("artist_error_list", [])
-                        if total_err == 0:
-                            st.success("모든 항목이 정상 계산되었습니다. (오류 0건)")
-                        else:
-                            st.error(f"총 {total_err}건의 계산 오류 발생")
-                            if artists_err:
-                                st.warning(f"문제 발생 아티스트: {list(set(artists_err))}")
-                else:
-                    st.write("검증 결과 데이터가 없습니다.")
+            ver_sum = cd.get("verification_summary", {})
+            total_err = ver_sum.get("total_errors", 0)
+            artists_err = ver_sum.get("artist_error_list", [])
+            if total_err == 0:
+                st.success("모든 항목이 정상 계산되었습니다. (오류 0건)")
             else:
-                st.write("검증 dict가 없습니다.")
+                st.error(f"총 {total_err}건의 계산 오류 발생!")
+                st.warning(f"문제 발생 아티스트: {list(set(artists_err))}")
 
-        # -------------------------
-        # (B) 두 번째 탭: 세부 검증
-        # -------------------------
         with tab2:
-            st.write("### 세부 검증 내용")
-            st.info("인풋데이터 vs. 산출결과 비교")
-            
-            show_detailed_verification()
+            show_detailed_verification(cd)
+
     else:
-        st.warning("정산 보고서 생성이 완료되면 이 섹션이 표시됩니다.")
+        st.info("정산 보고서 생성 완료 후, 검증 결과가 표시됩니다.")
 
 
-def section_three_upload_and_split_excel():
-    """
-    3) '엑셀(.xlsx)' 파일 업로드 후, 시트별로 분할 & ZIP 다운로드
-    (시트 내 서식/병합/스타일도 그대로 유지하는 방법)
-    """
-    if "report_done" in st.session_state and st.session_state["report_done"]:
-        st.subheader("3) '엑셀(.xlsx)' 파일 업로드 후, 시트별로 분할 / ZIP 다운로드 (서식 유지)")
+# ------------------------------------------
+# 3) 섹션3: 생성된 ZIP 다운로드
+# ------------------------------------------
+def section_three_download_zip():
+    if st.session_state.get("report_done", False):
+        st.subheader("3) 결과 ZIP 다운로드")
 
-        st.write("""
-        **사용 순서**  
-        1. 생성된 구글시트(보고서)에서 "**파일 → 다운로드 → Microsoft Excel (.xlsx)**"로 다운로드  
-        2. 아래 업로드 버튼으로 방금 받은 .xlsx 파일을 업로드  
-        3. 시트별로 분할된 XLSX 파일들을 ZIP으로 묶어 다운로드
-        """)
-
-        uploaded_file = st.file_uploader("엑셀 파일 업로드", type=["xlsx"])
-
-        if uploaded_file is not None:
-            # (C) 진행률 표시용
-            progress_bar = st.progress(0.0)
-            progress_text = st.empty()
-
-            # A) 업로드된 엑셀파일 전체를 BytesIO로 보관
-            original_file_data = uploaded_file.read()
-
-            # B) 한번 로드해서 시트명 리스트(순서 등) 파악
-            try:
-                # 여기서 한 번만 load_workbook
-                wb = openpyxl.load_workbook(io.BytesIO(original_file_data))
-            except Exception as e:
-                st.error(f"엑셀 파일을 읽는 중 오류가 발생했습니다: {e}")
-                return
-
-            sheet_names = wb.sheetnames
-            total_sheets = len(sheet_names)
-            if total_sheets == 0:
-                st.warning("업로드된 엑셀 파일에 시트가 없습니다.")
-                return
-
-            # (D) ZIP 버퍼 준비
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                # 시트별 분할
-                for i, sheet_name in enumerate(sheet_names):
-                    # 진행률 계산
-                    ratio = (i + 1) / total_sheets
-                    percent = int(ratio * 100)
-
-                    # 진행 상황 표시 (X% - 현재 처리중인 시트명)
-                    progress_bar.progress(ratio)
-                    progress_text.info(f"{percent}% 완료 - 시트 '{sheet_name}' 처리 중...")
-
-                    # (1) 다시 로드해서 시트만 남기기
-                    temp_wb = openpyxl.load_workbook(io.BytesIO(original_file_data))
-
-                    for s in temp_wb.sheetnames:
-                        if s != sheet_name:
-                            ws_remove = temp_wb[s]
-                            temp_wb.remove(ws_remove)
-
-                    single_buf = io.BytesIO()
-                    temp_wb.save(single_buf)
-                    single_buf.seek(0)
-
-                    safe_sheet_name = sheet_name.replace("/", "_").replace("\\", "_")
-                    zf.writestr(f"{safe_sheet_name}.xlsx", single_buf.getvalue())
-
-            zip_buf.seek(0)
-
-            # (E) 완료 메시지 + 다운로드 버튼
-            progress_text.success("모든 시트 분할 완료!")
+        zip_data = st.session_state.get("zip_data")
+        if zip_data:
             st.download_button(
                 label="ZIP 다운로드",
-                data=zip_buf.getvalue(),
-                file_name="split_sheets.zip",
+                data=zip_data,
+                file_name="정산결과보고서.zip",
                 mime="application/zip"
             )
+        else:
+            st.warning("ZIP 데이터가 없습니다.")
     else:
-        st.info("정산 보고서가 먼저 생성된 뒤에, 엑셀을 업로드할 수 있습니다.")
+        st.info("아직 보고서가 생성되지 않았습니다.")
 
 
-# ----------------------------------------------------------------
-# 검증(비교) 관련 헬퍼
-# ----------------------------------------------------------------
-
-def show_detailed_verification():
-
-    check_dict = st.session_state.get("check_dict", {})
+# --------------------------------------------------
+# (세부) 검증 정보 표시
+# --------------------------------------------------
+def show_detailed_verification(check_dict):
     dv = check_dict.get("details_verification", {})
     if not dv:
         st.warning("세부 검증 데이터가 없습니다.")
         return
 
-    # Sub-Tab 2개로 분리
     tabA, tabB = st.tabs(["정산서 검증", "세부매출 검증"])
 
     # 정산서 검증
     with tabA:
-        st.write("#### 정산서 검증")
         rows = dv.get("정산서", [])
         if not rows:
             st.info("정산서 검증 데이터가 없습니다.")
         else:
-            import pandas as pd
             df = pd.DataFrame(rows)
-
-            # match_* 컬럼들에 대해 True->초록, False->빨강
             bool_cols = [c for c in df.columns if c.startswith("match_")]
 
             def highlight_boolean(val):
@@ -304,35 +188,27 @@ def show_detailed_verification():
                 else:
                     return ""
 
-            # ▼ 여기에서 원하는 숫자 컬럼들만 정수로 보이게 format 설정
-            #   예: ["원본_곡비", "정산서_곡비", "원본_공제금액", "정산서_공제금액", ...]
-            #   실제 칼럼명은 코드 상황에 맞춰 지정하세요.
+            # 예시로 표시할 정수 칼럼들
             int_columns = [
                 "원본_곡비", "정산서_곡비",
                 "원본_공제금액", "정산서_공제금액",
                 "원본_공제후잔액", "정산서_공제후잔액",
                 "원본_정산율(%)", "정산서_정산율(%)"
-                # 필요하다면 더 추가
             ]
-
-            # style.format에 {칼럼명: 포맷} 형태의 딕셔너리를 넘기면 각 칼럼별로 적용 가능
-            # "{:.0f}" → 소수점 0자리, 즉 정수로 반올림 표시
             format_dict = {col: "{:.0f}" for col in int_columns if col in df.columns}
 
             st.dataframe(
                 df.style
-                  .format(format_dict)                     # 숫자 칼럼을 정수로 표시
-                  .applymap(highlight_boolean, subset=bool_cols)  # True/False 색상
+                  .format(format_dict)
+                  .applymap(highlight_boolean, subset=bool_cols)
             )
 
     # 세부매출 검증
     with tabB:
-        st.write("#### 세부매출 검증")
         rows = dv.get("세부매출", [])
         if not rows:
             st.info("세부매출 검증 데이터가 없습니다.")
         else:
-            import pandas as pd
             df = pd.DataFrame(rows)
             bool_cols = [c for c in df.columns if c.startswith("match_")]
 
@@ -344,9 +220,7 @@ def show_detailed_verification():
                 else:
                     return ""
 
-            # 예: "원본_매출액", "정산서_매출액" 같은 칼럼이 있다면 정수로 표시
-            int_columns = ["원본_매출액", "정산서_매출액"]  # 실제 코드 상황에 맞춰 수정
-
+            int_columns = ["원본_매출액", "정산서_매출액"]
             format_dict = {col: "{:.0f}" for col in int_columns if col in df.columns}
 
             st.dataframe(
@@ -356,12 +230,168 @@ def show_detailed_verification():
             )
 
 
+# --------------------------------------------------
+# 보고서 생성 (엑셀 기반)
+# --------------------------------------------------
+def generate_report_excel(ym, report_date, file_song_cost, file_online_revenue, check_dict):
+    """
+    업로드된 두 엑셀 파일을 openpyxl로 파싱 → 아티스트별 계산 → 
+    '정산서(artist).xlsx', '세부매출내역(artist).xlsx' 를 모두 ZIP으로 묶어 반환(bytes).
+    """
+    try:
+        wb_song = openpyxl.load_workbook(file_song_cost, data_only=True)
+        wb_revenue = openpyxl.load_workbook(file_online_revenue, data_only=True)
+    except Exception as e:
+        st.error(f"엑셀 파일을 읽는 중 오류가 발생했습니다: {e}")
+        return None
+
+    # (A) input_song cost: ym 시트 찾기
+    if ym not in wb_song.sheetnames:
+        st.error(f"[song cost] 파일에 '{ym}' 시트가 없습니다.")
+        return None
+    ws_sc = wb_song[ym]
+
+    rows_sc = list(ws_sc.values)
+    if not rows_sc:
+        st.error(f"[song cost] '{ym}' 시트가 비어있습니다.")
+        return None
+
+    header_sc = rows_sc[0]
+    body_sc = rows_sc[1:]
+    try:
+        idx_artist = header_sc.index("아티스트명")
+        idx_rate = header_sc.index("정산 요율")
+        idx_prev = header_sc.index("전월 잔액")
+        idx_deduct = header_sc.index("당월 차감액")
+        idx_remain = header_sc.index("당월 잔액")
+    except ValueError as e:
+        st.error(f"[song cost] 시트 컬럼명이 올바른지 확인 필요: {e}")
+        return None
+
+    def to_num(x):
+        if not x:
+            return 0.0
+        if isinstance(x, (int, float)):
+            return float(x)
+        x = str(x).replace("%", "").replace(",", "")
+        try:
+            return float(x)
+        except:
+            return 0.0
+
+    artist_cost_dict = {}
+    for row in body_sc:
+        if row is None:
+            continue
+        if len(row) < len(header_sc):
+            continue
+        a = row[idx_artist]
+        if not a:
+            continue
+        cost_data = {
+            "정산요율": to_num(row[idx_rate]),
+            "전월잔액": to_num(row[idx_prev]),
+            "당월차감액": to_num(row[idx_deduct]),
+            "당월잔액": to_num(row[idx_remain])
+        }
+        artist_cost_dict[a] = cost_data
+
+    # (B) input_online revenue: ym 시트 찾기
+    if ym not in wb_revenue.sheetnames:
+        st.error(f"[online revenue] 파일에 '{ym}' 시트가 없습니다.")
+        return None
+    ws_or = wb_revenue[ym]
+
+    rows_or = list(ws_or.values)
+    if not rows_or:
+        st.error(f"[online revenue] '{ym}' 시트가 비어있습니다.")
+        return None
+
+    header_or = rows_or[0]
+    body_or = rows_or[1:]
+    try:
+        col_aartist = header_or.index("앨범아티스트")
+        col_album = header_or.index("앨범명")
+        col_major = header_or.index("대분류")
+        col_middle = header_or.index("중분류")
+        col_service = header_or.index("서비스명")
+        col_revenue = header_or.index("권리사정산금액")
+    except ValueError as e:
+        st.error(f"[online revenue] 시트 컬럼명이 올바른지 확인 필요: {e}")
+        return None
+
+    artist_revenue_dict = defaultdict(list)
+    for row in body_or:
+        if row is None:
+            continue
+        if len(row) < len(header_or):
+            continue
+        aartist = str(row[col_aartist]).strip() if row[col_aartist] else ""
+        album = row[col_album] or ""
+        major = row[col_major] or ""
+        middle = row[col_middle] or ""
+        srv = row[col_service] or ""
+        rev_val = to_num(row[col_revenue])
+        if aartist:
+            artist_revenue_dict[aartist].append({
+                "album": album,
+                "major": major,
+                "middle": middle,
+                "service": srv,
+                "revenue": rev_val
+            })
+
+    # (C) 검증용: 아티스트 목록 비교
+    song_artists = list(artist_cost_dict.keys())
+    revenue_artists = list(artist_revenue_dict.keys())
+    check_dict["song_artists"] = song_artists
+    check_dict["revenue_artists"] = revenue_artists
+    compare_res = compare_artists(song_artists, revenue_artists)
+    check_dict["artist_compare_result"] = compare_res
+
+    all_artists = sorted(set(song_artists) | set(revenue_artists))
+
+    # 최종 ZIP
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        progress_bar = st.progress(0.0)
+        artist_placeholder = st.empty()
+
+        for i, artist in enumerate(all_artists):
+            ratio = (i+1)/len(all_artists)
+            progress_bar.progress(ratio)
+            artist_placeholder.info(f"[{i+1}/{len(all_artists)}] {artist} 처리 중...")
+
+            # 1) 세부매출 내역
+            detail_wb = create_detail_workbook(artist, ym, artist_revenue_dict[artist], check_dict)
+            detail_buf = io.BytesIO()
+            detail_wb.save(detail_buf)
+            detail_buf.seek(0)
+            zf.writestr(f"{artist}(세부매출내역).xlsx", detail_buf.getvalue())
+
+            # 2) 정산서
+            report_wb = create_report_workbook(
+                artist, ym, report_date,
+                artist_cost_dict.get(artist, {}),
+                artist_revenue_dict[artist],
+                check_dict
+            )
+            report_buf = io.BytesIO()
+            report_wb.save(report_buf)
+            report_buf.seek(0)
+            zf.writestr(f"{artist}(정산서).xlsx", report_buf.getvalue())
+
+        artist_placeholder.success("모든 아티스트 처리 완료!")
+        progress_bar.progress(1.0)
+
+    # ZIP 바이트를 반환
+    return zip_buf.getvalue()
+
+
+# -----------------------------------------
+# 헬퍼 함수: 아티스트 목록 비교
+# -----------------------------------------
 def compare_artists(song_artists, revenue_artists):
-    """
-    input_song cost 아티스트 목록(song_artists) vs
-    input_online revenue 아티스트 목록(revenue_artists) 비교.
-    반환: {'missing_in_song': [...], 'missing_in_revenue': [...], 'common_count': N ...}
-    """
     set_song = set(song_artists)
     set_revenue = set(revenue_artists)
     return {
@@ -372,2028 +402,297 @@ def compare_artists(song_artists, revenue_artists):
         "revenue_count": len(set_revenue),
     }
 
-def normalized_month(m):
-    """예: '202412' → (2024, 12). '202401' → (2024,1). 결과데이터 '2024년 12월'도 같은 것으로 간주 가능."""
-    m = m.strip()
-    if re.match(r'^\d{6}$', m):  # 202412
-        yyyy = int(m[:4])
-        mm = int(m[4:])
-        return (yyyy, mm)
-    # 혹은 '2024년 12월' => 정규표현식 파싱
-    pat = r'^(\d{4})년\s*(\d{1,2})월$'
-    mmatch = re.match(pat, m)
-    if mmatch:
-        yyyy = int(mmatch.group(1))
-        mm = int(mmatch.group(2))
-        return (yyyy, mm)
-    # 그 외는 원본 그대로
-    return m
 
 def almost_equal(a, b, tol=1e-3):
-    """숫자 비교용. 소수점/반올림 미세차이를 무시."""
+    """숫자 비교용: 소수점 오차 허용."""
     return abs(a - b) < tol
 
 
-# ========== [3] 보조 유틸 함수들 ===========
-def get_next_month_str(ym: str) -> str:
-    """'YYYYMM'을 입력받아 다음 달 'YYYYMM'을 반환."""
-    year = int(ym[:4])
-    month = int(ym[4:])
-    month += 1
-    if month > 12:
-        year += 1
-        month = 1
-    return f"{year}{month:02d}"
-
-def create_new_spreadsheet(filename: str, folder_id: str, drive_svc, attempt=1, max_attempts=5) -> str:
-    # (기존 코드 동일)
-    try:
-        query = (
-            f"parents in '{folder_id}' and trashed=false "
-            f"and name='{filename}'"
-        )
-        response = drive_svc.files().list(
-            q=query,
-            fields="files(id, name)",
-            pageSize=50
-        ).execute()
-        files = response.get("files", [])
-        if files:
-            existing_file_id = files[0]["id"]
-            print(f"파일 '{filename}' 이미 존재 -> 재사용 (ID={existing_file_id})")
-            return existing_file_id
-
-        file_metadata = {
-            "name": filename,
-            "mimeType": "application/vnd.google-apps.spreadsheet",
-            "parents": [folder_id],
-        }
-        file = drive_svc.files().create(body=file_metadata).execute()
-        return file["id"]
-
-    except HttpError as e:
-        # userRateLimitExceeded 등의 경우 재시도 예시
-        if (e.resp.status == 403 and
-            "userRateLimitExceeded" in str(e) and
-            attempt < max_attempts):
-            sleep_sec = 2 ** attempt
-            print(f"[WARN] userRateLimitExceeded -> {sleep_sec}초 후 재시도 ({attempt}/{max_attempts})")
-            time.sleep(sleep_sec)
-            return create_new_spreadsheet(filename, folder_id, drive_svc, attempt+1, max_attempts)
-        else:
-            raise e
-
-def batch_add_sheets(spreadsheet_id, sheet_svc, list_of_sheet_titles):
-    meta = sheet_svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    existing_sheets = meta["sheets"]
-    existing_titles = [s["properties"]["title"] for s in existing_sheets]
-
-    # 누락된 시트
-    missing = [t for t in list_of_sheet_titles if t not in existing_titles]
-    if not missing:
-        print("모든 시트가 이미 존재합니다.")
-        return
-
-    # 분할 크기 설정 (예: 30)
-    BATCH_SIZE = 30
-
-    # 하나의 batchUpdate "requests"를 모을 리스트
-    requests_add = []
-    total_count = 0
-    
-    for title in missing:
-        requests_add.append({
-            "addSheet": {
-                "properties": {
-                    "title": title,
-                    "gridProperties": {
-                        "rowCount": 200,
-                        "columnCount": 8
-                    }
-                }
-            }
-        })
-
-        # 만약 BATCH_SIZE(30)에 도달하면 API 호출
-        if len(requests_add) >= BATCH_SIZE:
-            body = {"requests": requests_add}
-            resp = sheet_svc.spreadsheets().batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body=body
-            ).execute()
-
-            total_count += len(resp["replies"])
-            print(f"분할 addSheet 완료: {len(resp['replies'])}개 생성")
-            requests_add.clear()
-            time.sleep(2)  # 잠깐 쉬기 (Rate Limit 완화)
-
-    # 남아있는 요청이 있으면 마무리 전송
-    if requests_add:
-        body = {"requests": requests_add}
-        resp = sheet_svc.spreadsheets().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body=body
-        ).execute()
-        total_count += len(resp["replies"])
-        print(f"마지막 addSheet 완료: {len(resp['replies'])}개 생성")
-        requests_add.clear()
-
-    print(f"시트 생성 총 개수: {total_count}")
-
-    # ***해당 코드 추가 확인 필요***
-    for idx, rep in enumerate(resp["replies"]):
-        sheet_props = rep["addSheet"]["properties"]
-        print(f" -> {idx} '{sheet_props['title']}' (sheetId={sheet_props['sheetId']})")
-
-
-def duplicate_worksheet_with_new_name(gs_obj, from_sheet_name: str, to_sheet_name: str):
-    all_ws = gs_obj.worksheets()
-    all_titles = [w.title for w in all_ws]
-    from_ws = None
-    for w in all_ws:
-        if w.title == from_sheet_name:
-            from_ws = w
-            break
-    if not from_ws:
-        raise ValueError(f"원본 시트 '{from_sheet_name}'를 찾을 수 없습니다.")
-
-    base_name = to_sheet_name
-    idx = 2
-    while to_sheet_name in all_titles:
-        to_sheet_name = f"{base_name} ({idx})"
-        idx += 1
-
-    new_ws = gs_obj.duplicate_sheet(source_sheet_id=from_ws.id, new_sheet_name=to_sheet_name)
-    return new_ws
-
-def is_korean_char(ch: str):
-    return "가" <= ch <= "힣"
-
-def is_korean_string(s: str):
-    return any(is_korean_char(ch) for ch in s)
-
-def album_sort_key(album_name: str):
-    return (0 if is_korean_string(album_name) else 1, album_name)
-
-def to_currency(num):
-    return f"₩{format(int(round(num)), ',')}"
-
-def update_next_month_tab(song_cost_sh, ym: str):
+# -----------------------------------------
+# (A) 세부매출내역 Workbook 생성
+# -----------------------------------------
+def create_detail_workbook(artist, ym, detail_list, check_dict):
     """
-    1) 이전 달(ym) 탭에서 아티스트별 '당월 잔액'을 수집
-    2) 다음 달 탭(next_ym)을 복제
-    3) 복제본의 '전월 잔액'을 (1)에서 가져온 값으로 세팅,
-       그리고 '당월 차감액', '당월 잔액' 컬럼은 모두 0으로 초기화
+    artist에 대한 세부매출내역 엑셀 파일을 생성하여 Workbook 객체로 반환.
+    detail_list: [{"album":..., "major":..., "middle":..., "service":..., "revenue":...}, ...]
     """
-
-    # (A) 이전 달 탭의 '아티스트명' & '당월 잔액' 읽어오기
-    old_ws = song_cost_sh.worksheet(ym)
-    old_data = old_ws.get_all_values()
-    if not old_data:
-        print(f"'{ym}' 탭이 비어 있음")
-        return
-
-    old_header = old_data[0]
-    old_body   = old_data[1:]
-
-    try:
-        idx_artist_old = old_header.index("아티스트명")
-        idx_remain_old = old_header.index("당월 잔액")
-    except ValueError:
-        print("이전 달 시트에 '아티스트명' 또는 '당월 잔액' 칼럼이 없습니다.")
-        return
-
-    prev_month_dict = {}
-    for row in old_body:
-        artist_name = row[idx_artist_old].strip()
-        if not artist_name or artist_name in ("합계","총계"):
-            continue
-        try:
-            remain_val = float(row[idx_remain_old].replace(",", ""))
-        except:
-            remain_val = 0.0
-
-        prev_month_dict[artist_name] = remain_val
-
-    # (B) 다음 달 탭 생성 (복제)
-    next_ym = get_next_month_str(ym)
-    new_ws = duplicate_worksheet_with_new_name(song_cost_sh, ym, next_ym)
-    new_data = new_ws.get_all_values()
-    if not new_data:
-        print(f"복제된 '{next_ym}' 탭이 비어 있습니다.")
-        return
-
-    new_header = new_data[0]
-    try:
-        idx_artist_new = new_header.index("아티스트명")
-        idx_prev_new   = new_header.index("전월 잔액")
-
-        # ★ '당월 차감액', '당월 잔액'도 찾아서 0으로 세팅
-        idx_deduct_new = new_header.index("당월 차감액")
-        idx_remain_new = new_header.index("당월 잔액")
-
-    except ValueError:
-        print("새로 만든 시트(다음 달 탭)에 필요한 칼럼('아티스트명', '전월 잔액', '당월 차감액', '당월 잔액')이 없습니다.")
-        return
-
-    # (C) 각 행 업데이트
-    content = new_data[1:]
-    updated = []
-    for row in content:
-        row_data = row[:]
-        artist_name_new = row_data[idx_artist_new].strip()
-
-        # 1) 전월 잔액 = 이전 달 탭의 '당월 잔액'
-        if artist_name_new in prev_month_dict:
-            row_data[idx_prev_new] = str(prev_month_dict[artist_name_new])
-
-        # 2) '당월 차감액'과 '당월 잔액'을 0으로 설정
-        row_data[idx_deduct_new] = "0"
-        row_data[idx_remain_new] = "0"
-
-        updated.append(row_data)
-
-    # (D) 업데이트 반영
-    if updated:
-        new_ws.update(
-            range_name="A2",
-            values=updated,
-            value_input_option="USER_ENTERED"
-        )
-    print(f"'{ym}' → '{next_ym}' 탭 복제 및 전월/당월 잔액 세팅 완료!")
-
-
-
-# ========== [4] 핵심 로직: generate_report =============
-def generate_report(
-    ym: str, 
-    report_date: str, 
-    check_dict: dict,
-    gc: gspread.Client,
-    drive_svc,
-    sheet_svc,
-    progress_bar,
-    artist_placeholder
-):
-    folder_id = st.secrets["google_service_account_a"]["folder_id"]
-
-    # ------------------- (A) input_song cost -------------------
-    try:
-        song_cost_sh = gc.open("input_song cost")
-    except gspread.exceptions.SpreadsheetNotFound:
-        st.error("Google Sheet 'input_song cost'를 찾을 수 없습니다.")
-        return ""
-
-    ws_map_sc = {ws.title: ws for ws in song_cost_sh.worksheets()}
-    if ym not in ws_map_sc:
-        st.error(f"input_song cost에 '{ym}' 탭이 없습니다.")
-        return ""
-    ws_sc = ws_map_sc[ym]
-    data_sc = ws_sc.get_all_values()
-    if not data_sc:
-        st.error(f"'{ym}' 탭이 비어있습니다.")
-        return ""
-    header_sc = data_sc[0]
-    rows_sc = data_sc[1:-1]
-
-    try:
-        idx_artist = header_sc.index("아티스트명")
-        idx_rate = header_sc.index("정산 요율")
-        idx_prev = header_sc.index("전월 잔액")
-        idx_deduct = header_sc.index("당월 차감액")
-        idx_remain = header_sc.index("당월 잔액")
-    except ValueError as e:
-        st.error(f"[input_song cost] 시트 컬럼 명이 맞는지 확인 필요: {e}")
-        return ""
-
-    def to_num(x):
-        if not x: return 0.0
-        return float(x.replace("%","").replace(",",""))
-
-    artist_cost_dict = {}
-    for row in rows_sc:
-        artist = row[idx_artist]
-        if not artist: 
-            continue
-        cost_data = {
-            "정산요율": to_num(row[idx_rate]),
-            "전월잔액": to_num(row[idx_prev]),
-            "당월차감액": to_num(row[idx_deduct]),
-            "당월잔액": to_num(row[idx_remain])
-        }
-        artist_cost_dict[artist] = cost_data
-
-    # ------------------- (B) input_online revenue -------------
-    try:
-        revenue_sh = gc.open("input_online revenue")
-    except gspread.exceptions.SpreadsheetNotFound:
-        st.error("Google Sheet 'input_online revenue'를 찾을 수 없습니다.")
-        return ""
-
-    ws_map_or = {ws.title: ws for ws in revenue_sh.worksheets()}
-    if ym not in ws_map_or:
-        st.error(f"input_online revenue에 '{ym}' 탭이 없습니다.")
-        return ""
-    ws_or = ws_map_or[ym]
-    data_or = ws_or.get_all_values()
-    if not data_or:
-        st.error(f"{ym} 탭이 비어있습니다.")
-        return ""
-
-    header_or = data_or[0]
-    rows_or = data_or[1:]
-    try:
-        col_aartist = header_or.index("앨범아티스트")
-        col_album   = header_or.index("앨범명")
-        col_major   = header_or.index("대분류")
-        col_middle  = header_or.index("중분류")
-        col_service = header_or.index("서비스명")
-        col_revenue = header_or.index("권리사정산금액")
-    except ValueError as e:
-        st.error(f"[input_online revenue] 시트 컬럼 명이 맞는지 확인 필요: {e}")
-        return ""
-
-    from collections import defaultdict
-    artist_revenue_dict = defaultdict(list)
-    for row in rows_or:
-        a = row[col_aartist].strip()
-        if not a:
-            continue
-        alb = row[col_album]
-        maj = row[col_major]
-        mid = row[col_middle]
-        srv = row[col_service]
-        try:
-            rv_val = float(row[col_revenue].replace(",",""))
-        except:
-            rv_val = 0.0
-        artist_revenue_dict[a].append({
-            "album": alb,
-            "major": maj,
-            "middle": mid,
-            "service": srv,
-            "revenue": rv_val
-        })
-
-
-    # ---------------------------------------------------------
-    # [추가] 체크 딕셔너리 안에 details_per_artist 키 준비
-    # ---------------------------------------------------------
-
-    # (A) 만약 check_dict 안에 'verification_summary' / 'details_verification' 가 없으면 초기화
-    if "verification_summary" not in check_dict:
-        check_dict["verification_summary"] = {
-            "total_errors": 0,
-            "artist_error_list": []
-        }
-
-    if "details_verification" not in check_dict:
-        check_dict["details_verification"] = {
-            "정산서": [],
-            "세부매출": []
-        }
-
-    if "details_per_artist" not in check_dict:
-        check_dict["details_per_artist"] = {}
-
-    # 검증
-    song_artists = [r[idx_artist] for r in rows_sc if r[idx_artist]]
-    revenue_artists = [r[col_aartist].strip() for r in rows_or if r[col_aartist].strip()]
-    check_dict["song_artists"] = song_artists
-    check_dict["revenue_artists"] = revenue_artists
-    compare_res = compare_artists(song_artists, revenue_artists)
-    check_dict["artist_compare_result"] = compare_res
-
-    # ------------------- (C) 아티스트 목록 ---------------
-    all_artists = sorted(set(artist_cost_dict.keys())|set(artist_revenue_dict.keys()))
-    all_artists = [a for a in all_artists if a and a != "합계"]
-    st.session_state["all_artists"] = all_artists
-
-    # ------------------- (D) output_report_YYYYMM --------
-    out_filename = f"ouput_report_{ym}"
-    out_file_id = create_new_spreadsheet(out_filename, folder_id, drive_svc)
-    out_sh = gc.open_by_key(out_file_id)
-    
-    # sheet1 삭제
-    try:
-        out_sh.del_worksheet(out_sh.worksheet("Sheet1"))
-    except:
-        pass
-
-    year_val = ym[:4]
-    month_val = ym[4:]
-
-    # (1) placeholder 준비
-    artist_placeholder = st.empty()
-
-    # (2) 진행률 바 준비
-    progress_bar = st.progress(0)
-
-    # ────────────── (1) batchUpdate를 한 번만 쓰기 위해 requests 모을 리스트 ──────────────
-    all_requests = []
-    
-    needed_titles = []
-    for artist in all_artists:
-        needed_titles.append(f"{artist}(세부매출내역)")
-        needed_titles.append(f"{artist}(정산서)")
-
-    # 3) batch_add_sheets
-    batch_add_sheets(out_file_id, sheet_svc, needed_titles)
-    # 이때, batch_add_sheets는 위에 예시로 만든 함수
-
-    # --------------- (E) 아티스트별 시트 만들기 -----------
-    for i, artist in enumerate(all_artists):
-        ratio = (i + 1) / len(all_artists)
-
-        # 진행률 바 업데이트
-        progress_bar.progress(ratio)
-
-        # placeholder에 “현재 아티스트” 안내
-        artist_placeholder.info(f"[{i+1}/{len(all_artists)}] '{artist}' 처리 중...")
-
-        # (실제 처리 로직 / time.sleep 등)
-
-        # ----------------------------
-        # 세부매출내역 탭
-        # ----------------------------
-        # ws_detail_name = f"{artist}(세부매출내역)"
-        # ws_detail = create_worksheet_if_not_exists(out_sh, ws_detail_name, rows=200, cols=7)
-        # ws_detail.clear()
-
-        ws_detail = out_sh.worksheet(f"{artist}(세부매출내역)")
-
-        # detail data
-        details = artist_revenue_dict[artist]
-        details_sorted = sorted(details, key=lambda d: album_sort_key(d["album"]))
-
-        detail_matrix = []
-        detail_matrix.append(["앨범아티스트","앨범명","대분류","중분류","서비스명","기간","매출 순수익"])
-
-        total_det = 0
-        for d in details_sorted:
-            rv = d["revenue"]
-            total_det += rv
-            detail_matrix.append([
-                artist,
-                d["album"],
-                d["major"],
-                d["middle"],
-                d["service"],
-                f"{year_val}년 {month_val}월",
-                to_currency(rv)
-            ])
-        detail_matrix.append(["합계","","","","","", to_currency(total_det)])
-        row_cursor_detail_end = len(detail_matrix)
-
-        ws_detail.update(
-            range_name="A1",
-            values=detail_matrix
-        )
-
-        time.sleep(3)        
-
-        # build requests:
-        detail_requests = []
-
-        # updateSheetProperties 로 resize
-        detail_requests.append({
-            "updateSheetProperties": {
-                "properties": {
-                    "sheetId": ws_detail.id,
-                    "gridProperties": {
-                        "rowCount": row_cursor_detail_end,
-                        "columnCount": 7
-                    }
-                },
-                "fields": "gridProperties(rowCount,columnCount)"
-            }
-        })
-
-        # 1) 열 너비 (A: 120, B:140, ...)
-        # updateDimensionProperties -> dimension='COLUMNS', range-> startIndex=0 ...
-        # A=0, B=1, ...
-        # 예시: A열(0)
-        detail_requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws_detail.id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 0, 
-                    "endIndex": 1  # A열 한 칸
-                },
-                "properties": {
-                    "pixelSize": 140
-                },
-                "fields": "pixelSize"
-            }
-        })
-        # B열
-        detail_requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws_detail.id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 1,  # B
-                    "endIndex": 2
-                },
-                "properties": {
-                    "pixelSize": 140
-                },
-                "fields": "pixelSize"
-            }
-        })
-        # E열 -> startIndex=4, endIndex=5
-        detail_requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws_detail.id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 4,
-                    "endIndex": 5
-                },
-                "properties": {
-                    "pixelSize": 120
-                },
-                "fields": "pixelSize"
-            }
-        })
-
-        # 2) row 높이: (옵션) 특정 행만 or 전체
-        # updateDimensionProperties -> dimension='ROWS'
-        #  예) 1행(0-based -> row=0) 높이 40
-        #    => startIndex=0, endIndex=1
-        # if needed
-
-        # 3) 헤더(A1:G1) 배경/폰트
-        #  => "repeatCell": { "range": ..., "cell": { "userEnteredFormat": {...} } }
-        #  여기서는 "헤더행" 하나만이므로 row=0..1, col=0..7
-        detail_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_detail.id,
-                    "startRowIndex": 0,
-                    "endRowIndex": 1,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red":1.0, "green":0.8, "blue":0.0},
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "bold": True,
-                            "foregroundColor": {"red":0,"green":0,"blue":0}
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-
-        # 4) 합계행 병합 & 포매팅
-        #    A{row_cursor_detail_end}:F{row_cursor_detail_end}
-        # => row_cursor_detail_end-1 (0-based)
-        # => ex) if 12행, then row=11
-        sum_row_0based = row_cursor_detail_end-1  # 0-based
-        # 병합
-        detail_requests.append({
-            "mergeCells": {
-                "range": {
-                    "sheetId": ws_detail.id,
-                    "startRowIndex": sum_row_0based,
-                    "endRowIndex": sum_row_0based+1,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": 6
-                },
-                "mergeType": "MERGE_ALL"
-            }
-        })
-        # 배경색/가운데 정렬
-        detail_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_detail.id,
-                    "startRowIndex": sum_row_0based,
-                    "endRowIndex": sum_row_0based+1,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": 6
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red":1.0,"green":0.8,"blue":0.0},
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        # 합계값 오른쪽 정렬 => G{sum_row_0based}
-        detail_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_detail.id,
-                    "startRowIndex": sum_row_0based,
-                    "endRowIndex": sum_row_0based+1,
-                    "startColumnIndex": 6,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "RIGHT",
-                        "textFormat": {"bold": True}
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,textFormat)"
-            }
-        })
-        # 매출 순수익 칼럼 값 오른쪽 정렬 
-        detail_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_detail.id,
-                    "startRowIndex": 1,
-                    "endRowIndex": sum_row_0based,
-                    "startColumnIndex": 6,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "RIGHT",
-                        "textFormat": {"bold": False}
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,textFormat)"
-            }
-        })
-
-        # 5) 전체 테두리
-        # => A1~G{row_cursor_detail_end}
-        # => row=0..row_cursor_detail_end, col=0..7
-        detail_requests.append({
-            "updateBorders": {
-                "range": {
-                    "sheetId": ws_detail.id,
-                    "startRowIndex": 0,
-                    "endRowIndex": row_cursor_detail_end,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": 7
-                },
-                "top":    {"style":"SOLID","width":1},
-                "bottom": {"style":"SOLID","width":1},
-                "left":   {"style":"SOLID","width":1},
-                "right":  {"style":"SOLID","width":1},
-                "innerHorizontal": {"style":"SOLID","width":1},
-                "innerVertical": {"style":"SOLID","width":1}
-            }
-        })
-
-        all_requests.extend(detail_requests)
-
-        # (추가) 분할 batchUpdate 체크
-        if len(all_requests) >= 200:  # 예: 80개 정도마다 전송
-            sheet_svc.spreadsheets().batchUpdate(
-                spreadsheetId=out_file_id,
-                body={"requests": all_requests}
-            ).execute()
-            all_requests.clear()     # 전송 후 비우기
-            time.sleep(3)           # 잠시 쉼 (네트워크 안정화)
-
-
-
-        # ------------------------------------------------------
-        # 정산서 탭 (batchUpdate 방식)
-        # ------------------------------------------------------
-
-        ws_report = out_sh.worksheet(f"{artist}(정산서)")
-        ws_report_id = ws_report.id
-        
-
-        # 1) report_matrix 생성 (기존 방식 그대로)
-        report_matrix = []
-        for _ in range(300):
-            report_matrix.append([""] * 8)
-
-        report_matrix[1][6] = report_date
-        report_matrix[3][1] = f"{year_val}년 {month_val}월 판매분"
-        report_matrix[5][1] = f"{artist}님 음원 정산 내역서"
-
-        report_matrix[7][0] = "•"
-        report_matrix[7][1] = "저희와 함께해 주셔서 정말 감사하고 앞으로도 잘 부탁드리겠습니다!"
-        report_matrix[8][0] = "•"
-        report_matrix[8][1] = f"{year_val}년 {month_val}월 음원의 수익을 아래와 같이 정산드립니다."
-        report_matrix[9][0] = "•"
-        report_matrix[9][1] = "정산 관련하여 문의사항이 있다면 무엇이든, 언제든 편히 메일 주세요!"
-        report_matrix[9][5] = "E-Mail : lucasdh3013@naver.com"
-
-        # 1. 음원 서비스별
-        report_matrix[12][0] = "1."
-        report_matrix[12][1] = "음원 서비스별 정산내역"
-        header_row1 = 13
-        headers_1 = ["앨범", "대분류", "중분류", "서비스명", "기간", "매출액"]
-        for i, val in enumerate(headers_1):
-            report_matrix[header_row1][1 + i] = val
-
-        row_cursor = header_row1 + 1
-        sum_1 = 0
-        for d in details_sorted:
-            rev = d["revenue"]
-            sum_1 += rev
-            report_matrix[row_cursor][1] = d["album"]
-            report_matrix[row_cursor][2] = d["major"]
-            report_matrix[row_cursor][3] = d["middle"]
-            report_matrix[row_cursor][4] = d["service"]
-            report_matrix[row_cursor][5] = f"{year_val}년 {month_val}월"
-            report_matrix[row_cursor][6] = to_currency(rev)
-            row_cursor += 1
-
-        row_cursor += 1
-        row_cursor_sum1 = row_cursor + 1
-        report_matrix[row_cursor][1] = "합계"
-        report_matrix[row_cursor][6] = to_currency(sum_1)
-        row_cursor += 2
-
-        # 2. 앨범별 정산
-        report_matrix[row_cursor][0] = "2."
-        report_matrix[row_cursor][1] = "앨범 별 정산 내역"
-        row_cursor += 1
-        row_cursor_album = row_cursor
-        report_matrix[row_cursor][1] = "앨범"
-        report_matrix[row_cursor][5] = "기간"
-        report_matrix[row_cursor][6] = "매출액"
-        row_cursor += 1
-
-        album_sum = defaultdict(float)
-        for d in details_sorted:
-            album_sum[d["album"]] += d["revenue"]
-
-        sum_2 = 0
-        for alb in sorted(album_sum.keys(), key=album_sort_key):
-            amt = album_sum[alb]
-            sum_2 += amt
-            report_matrix[row_cursor][1] = alb
-            report_matrix[row_cursor][5] = f"{year_val}년 {month_val}월"
-            report_matrix[row_cursor][6] = to_currency(amt)
-            row_cursor += 1
-
-        row_cursor_sum2 = row_cursor + 1
-        report_matrix[row_cursor][1] = "합계"
-        report_matrix[row_cursor][6] = to_currency(sum_2)
-        row_cursor += 2
-
-        # 3. 공제 내역
-        report_matrix[row_cursor][0] = "3."
-        report_matrix[row_cursor][1] = "공제 내역"
-        row_cursor += 1
-        row_cursor_deduction = row_cursor
-        report_matrix[row_cursor][1] = "앨범"
-        report_matrix[row_cursor][2] = "곡비"
-        report_matrix[row_cursor][3] = "공제 금액"
-        report_matrix[row_cursor][5] = "공제 후 남은 곡비"
-        report_matrix[row_cursor][6] = "공제 적용 금액"
-        row_cursor += 1
-
-        row_cursor_sum3 = row_cursor + 1
-        prev_val = artist_cost_dict[artist]["전월잔액"]
-        deduct_val = artist_cost_dict[artist]["당월차감액"]
-        remain_val = artist_cost_dict[artist]["당월잔액"]
-        공제적용 = sum_2 - deduct_val
-
-        alb_list = sorted(album_sum.keys(), key=album_sort_key)
-        alb_str = ", ".join(alb_list) if alb_list else "(앨범 없음)"
-        report_matrix[row_cursor][1] = alb_str
-        report_matrix[row_cursor][2] = to_currency(prev_val)
-        report_matrix[row_cursor][3] = to_currency(deduct_val)
-        report_matrix[row_cursor][5] = to_currency(remain_val)
-        report_matrix[row_cursor][6] = to_currency(공제적용)
-        row_cursor += 2
-
-        # 4. 수익 배분
-        report_matrix[row_cursor][0] = "4."
-        report_matrix[row_cursor][1] = "수익 배분"
-        row_cursor += 1
-        row_cursor_rate = row_cursor
-        report_matrix[row_cursor][1] = "앨범"
-        report_matrix[row_cursor][2] = "항목"
-        report_matrix[row_cursor][3] = "적용율"
-        report_matrix[row_cursor][6] = "적용 금액"
-        row_cursor += 1
-
-        rate_val = artist_cost_dict[artist]["정산요율"]
-        final_amount = 공제적용 * (rate_val / 100.0)
-        report_matrix[row_cursor][1] = alb_str
-        report_matrix[row_cursor][2] = "수익 배분율"
-        report_matrix[row_cursor][3] = f"{int(rate_val)}%"
-        report_matrix[row_cursor][6] = to_currency(final_amount)
-        row_cursor += 1
-
-        report_matrix[row_cursor][1] = "총 정산금액"
-        report_matrix[row_cursor][6] = to_currency(final_amount)
-        row_cursor_sum4 = row_cursor
-        row_cursor += 2
-
-        report_matrix[row_cursor][6] = "* 부가세 별도"
-        row_cursor_report_end = row_cursor + 2
-
-        # (2) 시트에 업데이트
-        ws_report.update(
-            range_name="A1",
-            values=report_matrix)
-
-
-
-        # ---------------------------------------------------------
-        # 계산된 값들 -> check_dict 에 저장
-        # ---------------------------------------------------------
-        # (A) 1번 음원 서비스별 매출 검증
-        for d in details_sorted:
-            album_service = (d["album"], d["service"])
-            original_val = d["revenue"]   # 원본
-            # 정산서 쪽도 사실상 d["revenue"]를 사용했으므로:
-            report_val = d["revenue"]
-            is_match = almost_equal(original_val, report_val)
-            if not is_match:
-                check_dict["verification_summary"]["total_errors"] += 1
-                check_dict["verification_summary"]["artist_error_list"].append(artist)
-
-            row_report_item = {
-                "아티스트": artist,
-                "구분": "음원서비스별매출",
-                "앨범": d["album"],
-                "서비스명": d["service"],
-                "원본_매출액": original_val,
-                "정산서_매출액": report_val,
-                "match_매출액": is_match,
-            }
-            check_dict["details_verification"]["세부매출"].append(row_report_item)
-
-        # (B) 3번 공제 내역 검증 (곡비/공제금액/공제 후 남은 곡비)
-        is_match_prev   = almost_equal(prev_val,  artist_cost_dict[artist]["전월잔액"])
-        is_match_deduct = almost_equal(deduct_val,artist_cost_dict[artist]["당월차감액"])
-        is_match_remain = almost_equal(remain_val,artist_cost_dict[artist]["당월잔액"])
-        if not (is_match_prev and is_match_deduct and is_match_remain):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "세부매출내역"
+
+    # 헤더
+    ws.append(["앨범아티스트", "앨범명", "대분류", "중분류", "서비스명", "기간", "매출 순수익"])
+
+    # 정렬(앨범명 등으로 정렬)
+    detail_list_sorted = sorted(detail_list, key=lambda x: (x["album"], x["service"]))
+
+    total_revenue = 0.0
+    year_val, month_val = ym[:4], ym[4:]
+    for d in detail_list_sorted:
+        rv = d["revenue"]
+        total_revenue += rv
+        ws.append([
+            artist,
+            d["album"],
+            d["major"],
+            d["middle"],
+            d["service"],
+            f"{year_val}년 {month_val}월",
+            rv
+        ])
+
+    # 합계 행
+    ws.append(["합계", "", "", "", "", "", total_revenue])
+
+    # 간단한 스타일 예시
+    # 1) 헤더 스타일
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="4CAF50")  # 연두/초록
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # 2) 합계행 스타일 (마지막 행)
+    last_row = ws.max_row
+    for c in range(1, 7):
+        cell = ws.cell(row=last_row, column=c)
+        cell.alignment = Alignment(horizontal="center")
+    sum_cell = ws.cell(row=last_row, column=7)
+    sum_font = Font(bold=True, color="000000")
+    sum_fill = PatternFill("solid", fgColor="FFD966")  # 옅은 노랑
+    sum_cell.font = sum_font
+    sum_cell.fill = sum_fill
+
+    # (검증 기록) → check_dict["details_verification"]["세부매출"] 에 추가
+    # 실제로는 "정산서 값과 match" 여부를 비교해야 하지만,
+    # 여기서는 generate_report_excel 쪽에서 처리하므로 생략
+
+    return wb
+
+
+# -----------------------------------------
+# (B) 정산서 Workbook 생성
+# -----------------------------------------
+def create_report_workbook(artist, ym, report_date, cost_data, detail_list, check_dict):
+    """
+    artist에 대한 "정산서" 엑셀 파일을 생성하여 Workbook 객체로 반환.
+    cost_data: {"정산요율":..., "전월잔액":..., "당월차감액":..., "당월잔액":...}
+    detail_list: [{"album":..., "major":..., "middle":..., "service":..., "revenue":...}, ...]
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "정산서"
+
+    year_val, month_val = ym[:4], ym[4:]
+
+    # -------------------------------
+    # 1) 머리글
+    # -------------------------------
+    ws["H2"] = f"{report_date} 발행"
+    ws["B4"] = f"{year_val}년 {month_val}월 판매분"
+    ws["B6"] = f"{artist}님 음원 정산 내역서"
+
+    ws["A8"] = "•"
+    ws["B8"] = "저희와 함께해 주셔서 정말 감사하고, 앞으로도 잘 부탁드립니다!"
+    ws["A9"] = "•"
+    ws["B9"] = f"{year_val}년 {month_val}월 음원 수익을 아래와 같이 정산드립니다."
+    ws["A10"] = "•"
+    ws["B10"] = "정산 관련 문의사항이 있다면 언제든 편히 연락주세요!"
+    ws["F10"] = "E-mail: help@xxxx.com"
+
+    # -------------------------------
+    # 2) 세부매출
+    # -------------------------------
+    row_start = 12
+    ws.cell(row=row_start, column=1, value="1.")
+    ws.cell(row=row_start, column=2, value="음원 서비스별 정산내역")
+
+    row_start += 1
+    headers = ["앨범", "대분류", "중분류", "서비스명", "기간", "매출액"]
+    for i, h in enumerate(headers, start=2):
+        ws.cell(row=row_start, column=i, value=h)
+
+    detail_list_sorted = sorted(detail_list, key=lambda x: (x["album"], x["service"]))
+    total_1 = 0.0
+    curr = row_start + 1
+    for d in detail_list_sorted:
+        rv = d["revenue"]
+        total_1 += rv
+
+        ws.cell(row=curr, column=2, value=d["album"])
+        ws.cell(row=curr, column=3, value=d["major"])
+        ws.cell(row=curr, column=4, value=d["middle"])
+        ws.cell(row=curr, column=5, value=d["service"])
+        ws.cell(row=curr, column=6, value=f"{year_val}년 {month_val}월")
+        ws.cell(row=curr, column=7, value=rv)
+        curr += 1
+
+    # 합계
+    curr += 1
+    ws.cell(row=curr, column=2, value="합계")
+    ws.cell(row=curr, column=7, value=total_1)
+    row_sum_1 = curr
+    curr += 2
+
+    # -------------------------------
+    # 3) 앨범 별 정산
+    # -------------------------------
+    ws.cell(row=curr, column=1, value="2.")
+    ws.cell(row=curr, column=2, value="앨범 별 정산 내역")
+    curr += 1
+
+    ws.cell(row=curr, column=2, value="앨범")
+    ws.cell(row=curr, column=6, value="기간")
+    ws.cell(row=curr, column=7, value="매출액")
+    curr += 1
+
+    album_sum = defaultdict(float)
+    for d in detail_list_sorted:
+        album_sum[d["album"]] += d["revenue"]
+
+    total_2 = 0.0
+    for alb in sorted(album_sum.keys()):
+        amt = album_sum[alb]
+        total_2 += amt
+        ws.cell(row=curr, column=2, value=alb)
+        ws.cell(row=curr, column=6, value=f"{year_val}년 {month_val}월")
+        ws.cell(row=curr, column=7, value=amt)
+        curr += 1
+
+    ws.cell(row=curr, column=2, value="합계")
+    ws.cell(row=curr, column=7, value=total_2)
+    row_sum_2 = curr
+    curr += 2
+
+    # -------------------------------
+    # 4) 공제 내역
+    # -------------------------------
+    ws.cell(row=curr, column=1, value="3.")
+    ws.cell(row=curr, column=2, value="공제 내역")
+    curr += 1
+
+    ws.cell(row=curr, column=2, value="앨범")
+    ws.cell(row=curr, column=3, value="곡비")
+    ws.cell(row=curr, column=4, value="공제 금액")
+    ws.cell(row=curr, column=6, value="공제 후 남은 곡비")
+    ws.cell(row=curr, column=7, value="공제 적용 금액")
+    curr += 1
+
+    prev_val = cost_data.get("전월잔액", 0.0)
+    deduct_val = cost_data.get("당월차감액", 0.0)
+    remain_val = cost_data.get("당월잔액", 0.0)
+
+    # 공제 적용된 매출액 = total_2 - 당월차감액
+    공제적용 = total_2 - deduct_val
+
+    alb_list = sorted(album_sum.keys())
+    alb_str = ", ".join(alb_list) if alb_list else "(앨범 없음)"
+
+    ws.cell(row=curr, column=2, value=alb_str)
+    ws.cell(row=curr, column=3, value=prev_val)
+    ws.cell(row=curr, column=4, value=deduct_val)
+    ws.cell(row=curr, column=6, value=remain_val)
+    ws.cell(row=curr, column=7, value=공제적용)
+    curr += 2
+
+    # -------------------------------
+    # 5) 수익 배분
+    # -------------------------------
+    ws.cell(row=curr, column=1, value="4.")
+    ws.cell(row=curr, column=2, value="수익 배분")
+    curr += 1
+
+    ws.cell(row=curr, column=2, value="앨범")
+    ws.cell(row=curr, column=3, value="항목")
+    ws.cell(row=curr, column=4, value="적용율")
+    ws.cell(row=curr, column=7, value="적용 금액")
+    curr += 1
+
+    rate_val = cost_data.get("정산요율", 0.0)
+    final_amount = 공제적용 * (rate_val / 100.0)
+
+    ws.cell(row=curr, column=2, value=alb_str)
+    ws.cell(row=curr, column=3, value="수익 배분율")
+    ws.cell(row=curr, column=4, value=f"{rate_val}%")
+    ws.cell(row=curr, column=7, value=final_amount)
+    curr += 1
+
+    ws.cell(row=curr, column=2, value="총 정산금액")
+    ws.cell(row=curr, column=7, value=final_amount)
+    curr += 2
+
+    ws.cell(row=curr, column=7, value="* 부가세 별도")
+
+    # (검증) check_dict["details_verification"]["정산서"] 에 매핑
+    #  - (1) 공제 내역 검증
+    is_match_prev = almost_equal(prev_val, cost_data.get("전월잔액", 0))
+    is_match_deduct = almost_equal(deduct_val, cost_data.get("당월차감액", 0))
+    is_match_remain = almost_equal(remain_val, cost_data.get("당월잔액", 0))
+    if not (is_match_prev and is_match_deduct and is_match_remain):
+        check_dict["verification_summary"]["total_errors"] += 1
+        check_dict["verification_summary"]["artist_error_list"].append(artist)
+
+    row_report_item_3 = {
+        "아티스트": artist,
+        "구분": "공제내역",
+        "원본_곡비": cost_data.get("전월잔액", 0),
+        "정산서_곡비": prev_val,
+        "match_곡비": is_match_prev,
+
+        "원본_공제금액": cost_data.get("당월차감액", 0),
+        "정산서_공제금액": deduct_val,
+        "match_공제금액": is_match_deduct,
+
+        "원본_공제후잔액": cost_data.get("당월잔액", 0),
+        "정산서_공제후잔액": remain_val,
+        "match_공제후잔액": is_match_remain,
+    }
+    check_dict["details_verification"]["정산서"].append(row_report_item_3)
+
+    #  - (2) 수익 배분율 검증
+    original_rate = cost_data.get("정산요율", 0)
+    is_rate_match = almost_equal(original_rate, rate_val)
+    if not is_rate_match:
+        check_dict["verification_summary"]["total_errors"] += 1
+        check_dict["verification_summary"]["artist_error_list"].append(artist)
+
+    row_report_item_4 = {
+        "아티스트": artist,
+        "구분": "수익배분율",
+        "원본_정산율(%)": original_rate,
+        "정산서_정산율(%)": rate_val,
+        "match_정산율": is_rate_match,
+    }
+    check_dict["details_verification"]["정산서"].append(row_report_item_4)
+
+    # 세부매출 검증(비교)
+    for d in detail_list_sorted:
+        original_val = d["revenue"]
+        # 정산서 쪽도 사실상 d["revenue"] 그대로 사용
+        report_val = d["revenue"]
+        is_match = almost_equal(original_val, report_val)
+        if not is_match:
             check_dict["verification_summary"]["total_errors"] += 1
             check_dict["verification_summary"]["artist_error_list"].append(artist)
 
-        row_report_item_3 = {
+        row_report_item = {
             "아티스트": artist,
-            "구분": "공제내역",
-            "원본_곡비": artist_cost_dict[artist]["전월잔액"],
-            "정산서_곡비": prev_val,
-            "match_곡비": is_match_prev,
-
-            "원본_공제금액": artist_cost_dict[artist]["당월차감액"],
-            "정산서_공제금액": deduct_val,
-            "match_공제금액": is_match_deduct,
-
-            "원본_공제후잔액": artist_cost_dict[artist]["당월잔액"],
-            "정산서_공제후잔액": remain_val,
-            "match_공제후잔액": is_match_remain,
+            "구분": "음원서비스별매출",
+            "앨범": d["album"],
+            "서비스명": d["service"],
+            "원본_매출액": original_val,
+            "정산서_매출액": report_val,
+            "match_매출액": is_match,
         }
-        check_dict["details_verification"]["정산서"].append(row_report_item_3)
+        check_dict["details_verification"]["세부매출"].append(row_report_item)
 
-        # (C) 4번 수익 배분율 검증
-        original_rate = artist_cost_dict[artist]["정산요율"]
-        report_rate   = rate_val   # 위에서 사용한 rate_val
-        is_rate_match = almost_equal(original_rate, report_rate)
-        if not is_rate_match:
-            check_dict["verification_summary"]["total_errors"] += 1
-            check_dict["verification_summary"]["artist_error_list"].append(artist)
+    # 간단히 “정산서” 제목 행에만 스타일 부여 예시
+    ws["B6"].font = Font(size=14, bold=True, color="000000")
+    ws["B6"].alignment = Alignment(horizontal="center", vertical="center")
 
-        row_report_item_4 = {
-            "아티스트": artist,
-            "구분": "수익배분율",
-            "원본_정산율(%)": original_rate,
-            "정산서_정산율(%)": report_rate,
-            "match_정산율": is_rate_match,
-        }
-        check_dict["details_verification"]["정산서"].append(row_report_item_4)
+    return wb
 
-
-        time.sleep(3)   
-
-        # (3) 한 번의 batchUpdate: 열너비, 행높이, 병합, 서식, 테두리 ...
-        report_requests = []
-
-        # updateSheetProperties 로 resize
-        report_requests.append({
-            "updateSheetProperties": {
-                "properties": {
-                    "sheetId": ws_report.id,
-                    "gridProperties": {
-                        "rowCount": row_cursor_report_end,
-                        "columnCount": 8
-                    }
-                },
-                "fields": "gridProperties(rowCount,columnCount)"
-            }
-        })
-
-        # 3-1) 열너비 (A=0, B=1, C=2, D=3, E=4, F=5, G=6, H=7)
-        report_requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 0,
-                    "endIndex": 1
-                },
-                "properties": { "pixelSize": 40 },
-                "fields": "pixelSize"
-            }
-        })
-        report_requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 1,
-                    "endIndex": 2
-                },
-                "properties": { "pixelSize": 200 },
-                "fields": "pixelSize"
-            }
-        })
-        report_requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 2,
-                    "endIndex": 3
-                },
-                "properties": { "pixelSize": 130 },
-                "fields": "pixelSize"
-            }
-        })
-        report_requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 3,
-                    "endIndex": 4
-                },
-                "properties": { "pixelSize": 120 },
-                "fields": "pixelSize"
-            }
-        })
-        report_requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 4,
-                    "endIndex": 5
-                },
-                "properties": { "pixelSize": 130 },
-                "fields": "pixelSize"
-            }
-        })
-        report_requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 5,
-                    "endIndex": 6
-                },
-                "properties": { "pixelSize": 130 },
-                "fields": "pixelSize"
-            }
-        })
-        report_requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 6,
-                    "endIndex": 7
-                },
-                "properties": { "pixelSize": 130 },
-                "fields": "pixelSize"
-            }
-        })
-        report_requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "dimension": "COLUMNS",
-                    "startIndex": 7,
-                    "endIndex": 8
-                },
-                "properties": { "pixelSize": 40 },
-                "fields": "pixelSize"
-            }
-        })
-
-        # 3-2) 행높이 (옵션) => 예) 4행(3 in 0-based), 6행(5 in 0-based) 높이=30
-        report_requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "dimension": "ROWS",
-                    "startIndex": 3,  # 4행
-                    "endIndex": 4
-                },
-                "properties": { "pixelSize": 30 },
-                "fields": "pixelSize"
-            }
-        })
-        report_requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "dimension": "ROWS",
-                    "startIndex": 5,  # 6행
-                    "endIndex": 6
-                },
-                "properties": { "pixelSize": 30 },
-                "fields": "pixelSize"
-            }
-        })
-
-
-        # 4-1) 상단 고정 항목(발행 날짜, H2: row=1, col=6)
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 1,
-                    "endRowIndex": 2,
-                    "startColumnIndex": 6,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "RIGHT",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": False
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })        
-
-        # 4-2) 상단 고정 항목(판매분, B4:E4)
-        report_requests.append({
-            "mergeCells": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 3,  # (4-1)
-                    "endRowIndex": 4,
-                    "startColumnIndex": 1,  # (B=1)
-                    "endColumnIndex": 5     # (E=4 => endIndex=5)
-                },
-                "mergeType": "MERGE_ALL"
-            }
-        })
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 3,
-                    "endRowIndex": 4,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 5
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "LEFT",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 15,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-
-        # 4-3) 상단 고정 항목(아티스트 정산내역서, B6:G6)
-        report_requests.append({
-            "mergeCells": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 5,
-                    "endRowIndex": 6,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 7
-                },
-                "mergeType": "MERGE_ALL"
-            }
-        })
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 5,
-                    "endRowIndex": 6,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.896, "green": 0.988, "blue": 1},
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 15,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-
-        # 4-4) 상단 고정 항목(안내문, B8:E8~B10:E10)
-        #8행
-        report_requests.append({
-            "mergeCells": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 7,  # (4-1)
-                    "endRowIndex": 8,
-                    "startColumnIndex": 1,  # (B=1)
-                    "endColumnIndex": 5     # (E=4 => endIndex=5)
-                },
-                "mergeType": "MERGE_ALL"
-            }
-        })
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 7,  # (4-1)
-                    "endRowIndex": 8,
-                    "startColumnIndex": 1,  # (B=1)
-                    "endColumnIndex": 5     # (E=4 => endIndex=5)
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "LEFT",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "bold": False
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        #9행
-        report_requests.append({
-            "mergeCells": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 8,  
-                    "endRowIndex": 9,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 5 
-                },
-                "mergeType": "MERGE_ALL"
-            }
-        })
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 8,  
-                    "endRowIndex": 9,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 5 
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "LEFT",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                          "bold": False
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        #10행
-        report_requests.append({
-            "mergeCells": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 9,  
-                    "endRowIndex": 10,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 5 
-                },
-                "mergeType": "MERGE_ALL"
-            }
-        })
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 9,  
-                    "endRowIndex": 10,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 5 
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "LEFT",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "bold": False
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        # 10행 (E-Mail 칸)
-        report_requests.append({
-            "mergeCells": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 9,  
-                    "endRowIndex": 10,
-                    "startColumnIndex": 5,
-                    "endColumnIndex": 7 
-                },
-                "mergeType": "MERGE_ALL"
-            }
-        })
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 9,
-                    "endRowIndex": 10,
-                    "startColumnIndex": 5,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "RIGHT",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "foregroundColor": {"red": 0.29, "green": 0.53, "blue": 0.91},
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        
-        # 4-5) 1열 정렬 (번호 영역)
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 1,
-                    "endRowIndex": row_cursor_rate+1,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": 1
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": False
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-
-        # 4-6) 하단 고정 항목(부가세, G)
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_report_end-2,
-                    "endRowIndex": row_cursor_report_end,
-                    "startColumnIndex": 6,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "RIGHT",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": False
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        }) 
-    
-
-        # 5-1) "음원 서비스별 정산내역" 표 타이틀
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 12,  # (4-1)
-                    "endRowIndex": 13,
-                    "startColumnIndex": 1,  # (B=1)
-                    "endColumnIndex": 2     # (E=4 => endIndex=5)
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "LEFT",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        # 5-2) "음원 서비스별 정산내역" 표 헤더 (Row=13)
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 13,
-                    "endRowIndex": 14,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.3, "green": 0.82, "blue": 0.88},
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        # 5-3) 합계행 전 병합
-        report_requests.append({
-            "mergeCells": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_sum1-2,
-                    "endRowIndex": row_cursor_sum1-1,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 7
-                },
-                "mergeType": "MERGE_ALL"
-            }
-        })
-        # 5-4) 합계행 병합
-        report_requests.append({
-            "mergeCells": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_sum1-1,
-                    "endRowIndex": row_cursor_sum1,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 6
-                },
-                "mergeType": "MERGE_ALL"
-            }
-        })
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_sum1-1,
-                    "endRowIndex": row_cursor_sum1,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 6
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.896, "green": 0.988, "blue": 1},
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_sum1-1,
-                    "endRowIndex": row_cursor_sum1,
-                    "startColumnIndex": 6,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.896, "green": 0.988, "blue": 1},
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        # 5-5) 표에 Banding (줄무늬 효과)
-        banding_start_row = 14
-        banding_end_row = row_cursor_sum1 - 2
-        banding_start_col = 1
-        banding_end_col = 7
-        if banding_end_row > banding_start_row:  # 유효범위 체크
-            report_requests.append({
-                "addBanding": {
-                    "bandedRange": {
-                        "range": {
-                            "sheetId": ws_report_id,
-                            "startRowIndex": banding_start_row,
-                            "endRowIndex": banding_end_row,
-                            "startColumnIndex": banding_start_col,
-                            "endColumnIndex": banding_end_col
-                        },
-                        "rowProperties": {
-                            "firstBandColor": {
-                                "red": 1.0, "green": 1.0, "blue": 1.0
-                            },
-                            "secondBandColor": {
-                                "red": 0.896, "green": 0.988, "blue": 1
-                            }
-                        },
-                        
-                    }
-                }
-            })
-            report_requests.append({
-                "repeatCell": {
-                    "range": {
-                        "sheetId": ws_report_id,
-                        "startRowIndex": banding_start_row,
-                        "endRowIndex": banding_end_row,
-                        "startColumnIndex": banding_start_col,
-                        "endColumnIndex": banding_end_col
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "horizontalAlignment": "CENTER",
-                            "verticalAlignment": "MIDDLE",
-                            "textFormat": {
-                                "fontFamily": "Malgun Gothic",
-                                "fontSize": 10,
-                                "bold": False
-                            }
-                        }
-                    },
-                    "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-                }
-            })
-
-
-        # 6-1) 앨범별 정산내역 타이틀
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_album-1,
-                    "endRowIndex": row_cursor_album,
-                    "startColumnIndex": 1, 
-                    "endColumnIndex": 2    
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "LEFT",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-
-        # 6-2) 앨범별 정산내역 헤더
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_album,
-                    "endRowIndex": row_cursor_album+1,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.3, "green": 0.82, "blue": 0.88},
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        # 6-3) 앨범별 정산내역 표 본문
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_album+1,
-                    "endRowIndex": row_cursor_sum2-1,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": False
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        # 6-4) 앨범별 정산내역 합계행
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_sum2-1,
-                    "endRowIndex": row_cursor_sum2,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        # 6-5) 합계행 병합
-        report_requests.append({
-            "mergeCells": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_sum2-1,
-                    "endRowIndex": row_cursor_sum2,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 6
-                },
-                "mergeType": "MERGE_ALL"
-            }
-        })
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_sum2-1,
-                    "endRowIndex": row_cursor_sum2,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 6
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.896, "green": 0.988, "blue": 1},
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_sum2-1,
-                    "endRowIndex": row_cursor_sum2,
-                    "startColumnIndex": 6,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.896, "green": 0.988, "blue": 1},
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-
-
-        # 7-1) 공제 내역 타이틀
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_deduction-1,  # (4-1)
-                    "endRowIndex": row_cursor_deduction,
-                    "startColumnIndex": 1,  # (B=1)
-                    "endColumnIndex": 2     # (E=4 => endIndex=5)
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "LEFT",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-
-        # 7-2) 공제 내역 헤더
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_deduction,
-                    "endRowIndex": row_cursor_deduction+1,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.3, "green": 0.82, "blue": 0.88},
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        
-        # 7-3) 공제 내역 표 본문 (데이터부분)
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_deduction+1,
-                    "endRowIndex": row_cursor_deduction+2,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 6
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": False
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        
-        # 7-4) 공제 내역 표 본문 (합계 부분)
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_deduction+1,
-                    "endRowIndex": row_cursor_deduction+2,
-                    "startColumnIndex": 6,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-
-
-        # 8-1) 수익 배분 타이틀
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_rate-1,
-                    "endRowIndex": row_cursor_rate,
-                    "startColumnIndex": 1,  
-                    "endColumnIndex": 2    
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "LEFT",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-
-        # 8-2) 수익 배분 헤더
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_rate,
-                    "endRowIndex": row_cursor_rate+1,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.3, "green": 0.82, "blue": 0.88},
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        
-        # 8-3) 수익 배분 표 본문 
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_rate+1,
-                    "endRowIndex": row_cursor_rate+2,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": False
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        
-        # 8-4) 수익 배분 표 합계행 병합
-        report_requests.append({
-            "mergeCells": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_sum4,
-                    "endRowIndex": row_cursor_sum4+1,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 6
-                },
-                "mergeType": "MERGE_ALL"
-            }
-        })
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_sum4,
-                    "endRowIndex": row_cursor_sum4+1,
-                    "startColumnIndex": 1,
-                    "endColumnIndex": 6
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.896, "green": 0.988, "blue": 1},
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-        report_requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": row_cursor_sum4,
-                    "endRowIndex": row_cursor_sum4+1,
-                    "startColumnIndex": 6,
-                    "endColumnIndex": 7
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.896, "green": 0.988, "blue": 1},
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "textFormat": {
-                            "fontFamily": "Malgun Gothic",
-                            "fontSize": 10,
-                            "bold": True
-                        }
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"
-            }
-        })
-
-
-        # 9-1) 전체 테두리 화이트
-        report_requests.append({
-            "updateBorders": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 0,
-                    "endRowIndex": row_cursor_report_end,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": 8
-                },
-                "top":    {"style": "SOLID","width":1, "color":{"red":1,"green":1,"blue":1}},
-                "bottom": {"style": "SOLID","width":1, "color":{"red":1,"green":1,"blue":1}},
-                "left":   {"style": "SOLID","width":1, "color":{"red":1,"green":1,"blue":1}},
-                "right":  {"style": "SOLID","width":1, "color":{"red":1,"green":1,"blue":1}},
-                "innerHorizontal": {"style":"SOLID","width":1,"color":{"red":1,"green":1,"blue":1}},
-                "innerVertical":   {"style":"SOLID","width":1,"color":{"red":1,"green":1,"blue":1}}
-            }
-        })
-        
-        # 9-2) 표 부분 점선 
-        def add_dotted_borders(r1, r2, c1, c2):
-            """바깥+안쪽 모두 DOTTED"""
-            report_requests.append({
-                "updateBorders": {
-                    "range": {
-                        "sheetId": ws_report_id,
-                        "startRowIndex": r1,
-                        "endRowIndex": r2,
-                        "startColumnIndex": c1,
-                        "endColumnIndex": c2
-                    },
-                    "top":    {"style": "DOTTED", "width": 1, "color":{"red":0,"green":0,"blue":0}},
-                    "bottom": {"style": "DOTTED", "width": 1, "color":{"red":0,"green":0,"blue":0}},
-                    "left":   {"style": "DOTTED", "width": 1, "color":{"red":0,"green":0,"blue":0}},
-                    "right":  {"style": "DOTTED", "width": 1, "color":{"red":0,"green":0,"blue":0}},
-                    "innerHorizontal": {"style": "DOTTED", "width": 1, "color":{"red":0,"green":0,"blue":0}},
-                    "innerVertical":   {"style": "DOTTED", "width": 1, "color":{"red":0,"green":0,"blue":0}}
-                }
-            })
-        # 1번 섹션 A14:G30 => row=13..30, col=0..7
-        add_dotted_borders(13, row_cursor_sum1, 1, 7)
-        # 2번 섹션 
-        add_dotted_borders(row_cursor_album, row_cursor_sum2, 1, 7)
-        # 3번 섹션 
-        add_dotted_borders(row_cursor_deduction, row_cursor_sum3, 1, 7)
-        # 4번 섹션 
-        add_dotted_borders(row_cursor_rate, row_cursor_sum4+1, 1, 7)
-        
-        # 9-3) 시트 외곽 검정 SOLID 
-        report_requests.append({
-            "updateBorders": {
-                "range": {
-                    "sheetId": ws_report_id,
-                    "startRowIndex": 0,
-                    "endRowIndex": row_cursor_report_end,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": 8
-                },
-                "top":    {"style": "SOLID","width":1, "color":{"red":0,"green":0,"blue":0}},
-                "bottom": {"style": "SOLID","width":1, "color":{"red":0,"green":0,"blue":0}},
-                "left":   {"style": "SOLID","width":1, "color":{"red":0,"green":0,"blue":0}},
-                "right":  {"style": "SOLID","width":1, "color":{"red":0,"green":0,"blue":0}}
-                # innerHorizontal, innerVertical는 생략 => 기존 값 유지
-            }
-        })
-        
-        all_requests.extend(report_requests)
-
-        # (추가) 분할 batchUpdate 체크
-        if len(all_requests) >200:
-            sheet_svc.spreadsheets().batchUpdate(
-                spreadsheetId=out_file_id,
-                body={"requests": all_requests}
-            ).execute()
-            all_requests.clear()
-            time.sleep(3)
-
-
-    # -----------------
-    # batchUpdate 실행
-    # -----------------
-    if all_requests:
-        sheet_svc.spreadsheets().batchUpdate(
-            spreadsheetId=out_file_id,
-            body={"requests": all_requests}
-        ).execute()
-        all_requests.clear()
-
-    time.sleep(2)
-
-    # 루프 끝나면 처리 완료 메시지 (원한다면)
-    artist_placeholder.success("모든 아티스트 처리 완료!")
-
-    # 다음 달 탭 복제
-    update_next_month_tab(song_cost_sh, ym)
-  
-    time.sleep(1)   
-
-    return out_file_id
-
-# ========== [5] Streamlit UI =============
-def main():
-    st.title("아티스트 음원 정산 보고서 자동 생성기")
-
-    # 2) 섹션 1: 보고서 생성
-    section_one_report_input()
-    st.divider()
-
-    # 3) 섹션 2: 시트 링크 및 검증 결과
-    section_two_sheet_link_and_verification()
-    st.divider()
-
-    # 4) 섹션 3: 압축파일 다운로드
-    section_three_upload_and_split_excel()
 
 if __name__ == "__main__":
     main()
