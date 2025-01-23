@@ -10,8 +10,6 @@ from openpyxl.utils import get_column_letter
 from collections import defaultdict
 import pandas as pd
 
-
-
 def main():
     st.title("아티스트 음원 정산 보고서 자동 생성기 (Excel 기반)")
 
@@ -38,19 +36,15 @@ def main():
 def section_one_report_input():
     st.subheader("1) 정산 보고서 생성")
 
-    # session_state에서 기본값 불러오기
     default_ym = st.session_state.get("ym", "")
     default_report_date = st.session_state.get("report_date", "")
 
-    # 사용자 입력
     ym = st.text_input("진행기간(YYYYMM)", default_ym)
     report_date = st.text_input("보고서 발행 날짜 (YYYY-MM-DD)", default_report_date)
 
-    # 엑셀 업로드 (두 개)
     uploaded_song_cost = st.file_uploader("input_song cost.xlsx 업로드", type=["xlsx"])
     uploaded_online_revenue = st.file_uploader("input_online revenue.xlsx 업로드", type=["xlsx"])
 
-    # 생성 버튼
     if st.button("정산 보고서 생성 시작"):
         if not re.match(r'^\d{6}$', ym):
             st.error("진행기간은 YYYYMM 6자리로 입력하세요.")
@@ -62,11 +56,9 @@ def section_one_report_input():
             st.error("두 개의 엑셀 파일을 모두 업로드해야 합니다.")
             return
 
-        # session_state에 입력값 저장
         st.session_state["ym"] = ym
         st.session_state["report_date"] = report_date
 
-        # 검증용 dict
         check_dict = {
             "song_artists": [],
             "revenue_artists": [],
@@ -81,7 +73,6 @@ def section_one_report_input():
             }
         }
 
-        # 실제 보고서 생성
         zip_data = generate_report_excel(
             ym, report_date,
             uploaded_song_cost,
@@ -91,7 +82,6 @@ def section_one_report_input():
 
         if zip_data is not None:
             st.success("정산 보고서 생성 완료! 아래 섹션에서 ZIP 다운로드 가능")
-            # st.session_state에 기록
             st.session_state["report_done"] = True
             st.session_state["zip_data"] = zip_data
             st.session_state["check_dict"] = check_dict
@@ -111,7 +101,6 @@ def section_two_verification():
             st.info("검증 데이터가 없습니다.")
             return
 
-        # 탭 2개
         tab1, tab2 = st.tabs(["검증 요약", "세부 검증 내용"])
 
         with tab1:
@@ -142,7 +131,7 @@ def section_two_verification():
 
 
 # ------------------------------------------
-# 3) 섹션3: 생성된 ZIP 다운로드
+# 3) 섹션3: 결과 ZIP 다운로드
 # ------------------------------------------
 def section_three_download_zip():
     if st.session_state.get("report_done", False):
@@ -163,7 +152,7 @@ def section_three_download_zip():
 
 
 # --------------------------------------------------
-# (세부) 검증 정보 표시
+# 검증 표시 함수
 # --------------------------------------------------
 def show_detailed_verification(check_dict):
     dv = check_dict.get("details_verification", {})
@@ -173,7 +162,6 @@ def show_detailed_verification(check_dict):
 
     tabA, tabB = st.tabs(["정산서 검증", "세부매출 검증"])
 
-    # 정산서 검증
     with tabA:
         rows = dv.get("정산서", [])
         if not rows:
@@ -190,7 +178,6 @@ def show_detailed_verification(check_dict):
                 else:
                     return ""
 
-            # 예시로 표시할 정수 칼럼들
             int_columns = [
                 "원본_곡비", "정산서_곡비",
                 "원본_공제금액", "정산서_공제금액",
@@ -205,7 +192,6 @@ def show_detailed_verification(check_dict):
                   .applymap(highlight_boolean, subset=bool_cols)
             )
 
-    # 세부매출 검증
     with tabB:
         rows = dv.get("세부매출", [])
         if not rows:
@@ -230,9 +216,6 @@ def show_detailed_verification(check_dict):
                   .format(format_dict)
                   .applymap(highlight_boolean, subset=bool_cols)
             )
-
-
-
 
 # --------------------------------------------------
 # 정산서 스타일
@@ -640,57 +623,42 @@ def style_rate_table(ws, info):
     cell_g.border = Border(left=dotted_side, right=dotted_side,
                            top=dotted_side, bottom=dotted_side)
 
-
 def create_report_excel(artist, service_list, album_list, deduction_list, rate_list):
-    """
-    아티스트별 정산서 엑셀을 생성:
-      1) 음원 서비스별 (write_service_table + style_service_table)
-      2) 앨범별 (write_album_table + style_album_table)
-      3) 공제 내역 (write_deduction_table + style_deduction_table)
-      4) 수익 배분 (write_rate_table + style_rate_table)
-
-    service_list, album_list, deduction_list, rate_list 는
-    각각 dict 목록이며, 위의 write_XXX 함수에서 쓰이는 구조로 맞추면 됨.
-    """
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = f"{artist}(정산서)"
 
-    # (1) 음원 서비스별
-    row_cursor = 12  # 예시로 12행부터 시작
+    # 1) 음원 서비스별
+    row_cursor = 12
     info_service = write_service_table(ws, row_cursor, service_list)
     style_service_table(ws, info_service)
     row_cursor = info_service["next_start_row"]
 
-    # (2) 앨범별
+    # 2) 앨범별
     info_album = write_album_table(ws, row_cursor, album_list)
     style_album_table(ws, info_album)
     row_cursor = info_album["next_start_row"]
 
-    # (3) 공제 내역
+    # 3) 공제 내역
     info_ded = write_deduction_table(ws, row_cursor, deduction_list)
     style_deduction_table(ws, info_ded)
     row_cursor = info_ded["next_start_row"]
 
-    # (4) 수익 배분
+    # 4) 수익 배분
     info_rate = write_rate_table(ws, row_cursor, rate_list)
     style_rate_table(ws, info_rate)
     row_cursor = info_rate["next_start_row"]
 
-    # 시트 외곽 테두리, 열너비, 기타
-    from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+    # 전체 외곽 테두리, 열너비 등
     thin_side = Side(style="thin", color="000000")
-    # 대충 row=1..(row_cursor+10), col=1..8
     for r in range(1, row_cursor+10):
         for c in range(1, 9):
             cell = ws.cell(row=r, column=c)
-            # 이미 dotted인 부분이 있어도 덮어쓸 수 있음
             cell.border = Border(
                 top=thin_side, left=thin_side,
                 right=thin_side, bottom=thin_side
             )
 
-    # 열너비
     ws.column_dimensions["A"].width = 5
     ws.column_dimensions["B"].width = 25
     ws.column_dimensions["C"].width = 16
@@ -700,12 +668,9 @@ def create_report_excel(artist, service_list, album_list, deduction_list, rate_l
     ws.column_dimensions["G"].width = 16
     ws.column_dimensions["H"].width = 5
 
-    # 최종 저장
     filename = f"{artist}_정산서.xlsx"
     wb.save(filename)
-
     return filename
-
 
 
 # --------------------------------------------------
@@ -818,17 +783,13 @@ def apply_detail_style(ws, header_row, data_start, data_end, sum_row):
     ws.column_dimensions["F"].width = 15
     ws.column_dimensions["G"].width = 15
 
-
 def create_detail_excel(artist, detail_list):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = f"{artist}(세부매출내역)"
 
-    # 1) 데이터 작성
     out_info = write_detail_data(ws, detail_list, start_row=1)
-    # => out_info = {"header_row":1, "data_start":2, "data_end":N, "sum_row":N+1, ...}
 
-    # 2) 스타일 적용
     apply_detail_style(
         ws,
         header_row=out_info["header_row"],
@@ -837,11 +798,9 @@ def create_detail_excel(artist, detail_list):
         sum_row=out_info["sum_row"]
     )
 
-    # 3) 저장 (데모용)
     filename = f"{artist}_세부매출.xlsx"
     wb.save(filename)
-    return filename
-
+    return wb  # Workbook 객체 반환 (ZIP으로 저장 시 사용)
 
 
 # --------------------------------------------------
@@ -849,9 +808,22 @@ def create_detail_excel(artist, detail_list):
 # --------------------------------------------------
 def generate_report_excel(ym, report_date, file_song_cost, file_online_revenue, check_dict):
     """
-    업로드된 두 엑셀 파일을 openpyxl로 파싱 → 아티스트별 계산 → 
-    '정산서(artist).xlsx', '세부매출내역(artist).xlsx' 를 모두 ZIP으로 묶어 반환(bytes).
+    업로드된 두 엑셀 파일(file_song_cost, file_online_revenue)을 openpyxl로 파싱 →
+    아티스트별로:
+      1) 세부매출내역(artist).xlsx
+      2) 정산서(artist).xlsx
+    을 각각 생성, ZIP으로 묶어 반환 (bytes).
+
+    - ym: "YYYYMM"
+    - report_date: "YYYY-MM-DD"
+    - file_song_cost: 업로드된 엑셀( song cost.xlsx )
+    - file_online_revenue: 업로드된 엑셀( online revenue.xlsx )
+    - check_dict: 검증용 딕셔너리 (실제 계산/비교 결과를 저장)
+
+    반환: zip(bytes) or None
     """
+
+    # ---------------------- (A) 엑셀 파싱 ----------------------
     try:
         wb_song = openpyxl.load_workbook(file_song_cost, data_only=True)
         wb_revenue = openpyxl.load_workbook(file_online_revenue, data_only=True)
@@ -859,12 +831,12 @@ def generate_report_excel(ym, report_date, file_song_cost, file_online_revenue, 
         st.error(f"엑셀 파일을 읽는 중 오류가 발생했습니다: {e}")
         return None
 
-    # (A) input_song cost: ym 시트 찾기
+    # 1) song cost → ym 시트
     if ym not in wb_song.sheetnames:
         st.error(f"[song cost] 파일에 '{ym}' 시트가 없습니다.")
         return None
-    ws_sc = wb_song[ym]
 
+    ws_sc = wb_song[ym]
     rows_sc = list(ws_sc.values)
     if not rows_sc:
         st.error(f"[song cost] '{ym}' 시트가 비어있습니다.")
@@ -872,6 +844,8 @@ def generate_report_excel(ym, report_date, file_song_cost, file_online_revenue, 
 
     header_sc = rows_sc[0]
     body_sc = rows_sc[1:]
+
+    # 필요한 컬럼 인덱스 찾기
     try:
         idx_artist = header_sc.index("아티스트명")
         idx_rate = header_sc.index("정산 요율")
@@ -895,12 +869,10 @@ def generate_report_excel(ym, report_date, file_song_cost, file_online_revenue, 
 
     artist_cost_dict = {}
     for row in body_sc:
-        if row is None:
+        if not row or len(row) < len(header_sc):
             continue
-        if len(row) < len(header_sc):
-            continue
-        a = row[idx_artist]
-        if not a:
+        artist_name = row[idx_artist]
+        if not artist_name:
             continue
         cost_data = {
             "정산요율": to_num(row[idx_rate]),
@@ -908,14 +880,13 @@ def generate_report_excel(ym, report_date, file_song_cost, file_online_revenue, 
             "당월차감액": to_num(row[idx_deduct]),
             "당월잔액": to_num(row[idx_remain])
         }
-        artist_cost_dict[a] = cost_data
+        artist_cost_dict[artist_name] = cost_data
 
-    # (B) input_online revenue: ym 시트 찾기
+    # 2) online revenue → ym 시트
     if ym not in wb_revenue.sheetnames:
         st.error(f"[online revenue] 파일에 '{ym}' 시트가 없습니다.")
         return None
     ws_or = wb_revenue[ym]
-
     rows_or = list(ws_or.values)
     if not rows_or:
         st.error(f"[online revenue] '{ym}' 시트가 비어있습니다.")
@@ -936,16 +907,15 @@ def generate_report_excel(ym, report_date, file_song_cost, file_online_revenue, 
 
     artist_revenue_dict = defaultdict(list)
     for row in body_or:
-        if row is None:
-            continue
-        if len(row) < len(header_or):
+        if not row or len(row) < len(header_or):
             continue
         aartist = str(row[col_aartist]).strip() if row[col_aartist] else ""
-        album = row[col_album] or ""
-        major = row[col_major] or ""
-        middle = row[col_middle] or ""
-        srv = row[col_service] or ""
+        album   = str(row[col_album])   if row[col_album]   else ""
+        major   = str(row[col_major])   if row[col_major]   else ""
+        middle  = str(row[col_middle])  if row[col_middle]  else ""
+        srv     = str(row[col_service]) if row[col_service] else ""
         rev_val = to_num(row[col_revenue])
+
         if aartist:
             artist_revenue_dict[aartist].append({
                 "album": album,
@@ -955,40 +925,105 @@ def generate_report_excel(ym, report_date, file_song_cost, file_online_revenue, 
                 "revenue": rev_val
             })
 
-    # (C) 검증용: 아티스트 목록 비교
-    song_artists = list(artist_cost_dict.keys())
-    revenue_artists = list(artist_revenue_dict.keys())
+    # ---------------------- (B) 아티스트 목록 비교 ----------------------
+    song_artists = sorted(artist_cost_dict.keys())
+    revenue_artists = sorted(artist_revenue_dict.keys())
     check_dict["song_artists"] = song_artists
     check_dict["revenue_artists"] = revenue_artists
+
     compare_res = compare_artists(song_artists, revenue_artists)
     check_dict["artist_compare_result"] = compare_res
 
+    # 전체 아티스트(둘 중 하나라도 존재)
     all_artists = sorted(set(song_artists) | set(revenue_artists))
 
-    # 최종 ZIP
+    # ---------------------- (C) 아티스트별 엑셀 생성 & ZIP ----------------------
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         progress_bar = st.progress(0.0)
         artist_placeholder = st.empty()
 
         for i, artist in enumerate(all_artists):
-            ratio = (i+1)/len(all_artists)
+            ratio = (i + 1) / len(all_artists)
             progress_bar.progress(ratio)
             artist_placeholder.info(f"[{i+1}/{len(all_artists)}] {artist} 처리 중...")
 
-            # 1) 세부매출 내역
-            detail_wb = create_detail_workbook(artist, ym, artist_revenue_dict[artist], check_dict)
+            # 1) 해당 아티스트의 cost_data, revenue_list
+            cost_data = artist_cost_dict.get(artist, {
+                "정산요율":0, "전월잔액":0, "당월차감액":0, "당월잔액":0
+            })
+            detail_list = artist_revenue_dict[artist]  # [{album, major, middle, service, revenue}, ...]
+
+            # (A) 세부매출내역(.xlsx)
+            #   write_detail_data + apply_detail_style 방식
+            detail_wb = create_detail_excel(artist, ym, detail_list)
             detail_buf = io.BytesIO()
             detail_wb.save(detail_buf)
             detail_buf.seek(0)
             zf.writestr(f"{artist}(세부매출내역).xlsx", detail_buf.getvalue())
 
-            # 2) 정산서
-            report_wb = create_report_workbook(
-                artist, ym, report_date,
-                artist_cost_dict.get(artist, {}),
-                artist_revenue_dict[artist],
-                check_dict
+            # (B) 정산서(.xlsx)
+            #   4섹션(write_service_table + style_service_table, etc.)
+            #   우선 "service_list", "album_list", "deduction_list", "rate_list"를 구성
+            #   또는, 단순히 detail_list를 가공해서 service_list, album_list 만들 수도 있음
+
+            # (예시) service_list = detail_list와 동일하게 구성
+            service_list = []
+            for d in detail_list:
+                service_item = {
+                    "album": d["album"],
+                    "major": d["major"],
+                    "middle": d["middle"],
+                    "service": d["service"],
+                    "year": ym[:4],
+                    "month": ym[4:],
+                    "revenue": d["revenue"]
+                }
+                service_list.append(service_item)
+
+            # (앨범별) album_list
+            #   album별 revenue 합산
+            album_dict = defaultdict(float)
+            for d in detail_list:
+                album_dict[d["album"]] += d["revenue"]
+            album_list = []
+            for alb, amt in album_dict.items():
+                album_list.append({
+                    "album": alb,
+                    "year": ym[:4],
+                    "month": ym[4:],
+                    "revenue": amt
+                })
+
+            # (공제 내역) deduction_list
+            #   cost_data["전월잔액"], cost_data["당월차감액"], cost_data["당월잔액"]
+            #   after_deduct = (album합계 - 당월차감액) 등
+            total_album_sum = sum(album_dict.values())
+            after_deduct = total_album_sum - cost_data["당월차감액"]
+            ded_list = [{
+                "album": ", ".join(album_dict.keys()) if album_dict else "(앨범 없음)",
+                "prev_cost": cost_data["전월잔액"],
+                "deduct_cost": cost_data["당월차감액"],
+                "remain_cost": cost_data["당월잔액"],
+                "after_deduct": after_deduct
+            }]
+
+            # (수익 배분) rate_list
+            #   rate = cost_data["정산요율"]
+            #   applied_amount = after_deduct * (rate/100)
+            applied_amount = after_deduct * (cost_data["정산요율"]/100.0)
+            rate_list = [{
+                "album": ", ".join(album_dict.keys()) if album_dict else "(앨범 없음)",
+                "rate": cost_data["정산요율"],
+                "applied_amount": applied_amount
+            }]
+
+            report_wb = create_report_excel(
+                artist,
+                service_list,
+                album_list,
+                ded_list,
+                rate_list
             )
             report_buf = io.BytesIO()
             report_wb.save(report_buf)
@@ -998,7 +1033,6 @@ def generate_report_excel(ym, report_date, file_song_cost, file_online_revenue, 
         artist_placeholder.success("모든 아티스트 처리 완료!")
         progress_bar.progress(1.0)
 
-    # ZIP 바이트를 반환
     return zip_buf.getvalue()
 
 
