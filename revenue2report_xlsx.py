@@ -783,7 +783,8 @@ def apply_detail_style(ws, header_row, data_start, data_end, sum_row):
     ws.column_dimensions["F"].width = 15
     ws.column_dimensions["G"].width = 15
 
-def create_detail_excel(artist, detail_list):
+
+def create_detail_excel(artist, ym, detail_list):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = f"{artist}(세부매출내역)"
