@@ -6,8 +6,10 @@ import zipfile
 import openpyxl
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
 from collections import defaultdict
 import pandas as pd
+
 
 
 def main():
@@ -228,6 +230,314 @@ def show_detailed_verification(check_dict):
                   .format(format_dict)
                   .applymap(highlight_boolean, subset=bool_cols)
             )
+
+
+
+
+# --------------------------------------------------
+# 정산서 스타일
+# --------------------------------------------------
+def apply_report_sheet_style(ws,
+                            row_start_service,
+                            row_sum_service,
+                            row_start_album,
+                            row_sum_album,
+                            row_start_deduction,
+                            row_end_deduction,
+                            row_start_rate,
+                            row_end_rate,
+                            row_total_end):
+    """
+    [정산서] 시트에 대해,
+    기존 Google Sheets batchUpdate(report_requests) 로 설정했던 스타일을
+    openpyxl로 최대한 동일하게 재현한 예시.
+
+    인자 예시:
+    - row_start_service: "1) 음원 서비스별 정산내역" 테이블 헤더 시작행 (예: 13)
+    - row_sum_service:   "1) 음원 서비스별 정산내역" 합계행 (예: 20)
+    - row_start_album:   "2) 앨범별 정산 내역" 시작행
+    - row_sum_album:     "2) 앨범별 정산 내역" 합계행
+    - ...
+    - row_total_end:     실제 시트에서 마지막으로 쓰인 행
+
+    실제 코드에서는
+      generate_report_excel() 내부에서
+      데이터 작성 후 row_cursor 등을 구해 이 함수를 호출하면 됩니다.
+    """
+
+    # ----------------------------------------------------------
+    # 1) 열너비
+    #    원본 예: A=0(40px), B=1(200px), C=2(130px), ...
+    #    openpyxl은 약간씩 보정 필요
+    # ----------------------------------------------------------
+    ws.column_dimensions["A"].width = 5   # 예) 40px ~ 대략 5
+    ws.column_dimensions["B"].width = 25  # 200px ~ 대략 25
+    ws.column_dimensions["C"].width = 16  # 130px ~ 대략 16
+    ws.column_dimensions["D"].width = 15
+    ws.column_dimensions["E"].width = 16
+    ws.column_dimensions["F"].width = 16
+    ws.column_dimensions["G"].width = 16
+    ws.column_dimensions["H"].width = 5
+
+    # ----------------------------------------------------------
+    # 2) 특정 행 높이 (예: 4행, 6행 각각 30px)
+    # ----------------------------------------------------------
+    ws.row_dimensions[4].height = 22  # 약 30px 근사
+    ws.row_dimensions[6].height = 22
+
+    # ----------------------------------------------------------
+    # 3) 상단 병합 & 스타일 (B4~E4), (B6~G6), (B8~E8) ...
+    #    원본 batchUpdate에서 "mergeCells" + "repeatCell" 했던 부분
+    # ----------------------------------------------------------
+
+    # 3-1) B4~E4 병합
+    ws.merge_cells("B4:E4")
+    for row in range(4, 5):
+        for col in range(2, 6):  # B~E
+            cell = ws.cell(row=row, column=col)
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+            cell.font = Font(bold=True, size=15)
+
+    # 3-2) B6~G6 병합
+    ws.merge_cells("B6:G6")
+    for row in range(6, 7):
+        for col in range(2, 8):  # B~G
+            cell = ws.cell(row=row, column=col)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            # 배경색 (r=0.896, g=0.988, b=1) → #E5FCFF 근사
+            cell.fill = PatternFill("solid", fgColor="E5FCFF")
+            cell.font = Font(bold=True, size=15)
+
+    # 3-3) 예: B8~E8 병합, B9~E9 병합, B10~E10 병합
+    #    Google Sheets 코드: row=7..8, row=8..9, row=9..10 (0-based)
+    ws.merge_cells("B8:E8")
+    ws.merge_cells("B9:E9")
+    ws.merge_cells("B10:E10")
+
+    for r in [8, 9, 10]:
+        for c in range(2, 6):  # B~E
+            cell = ws.cell(row=r, column=c)
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+            cell.font = Font(bold=False)
+
+    # 이메일칸(F10~G10 병합)
+    ws.merge_cells("F10:G10")
+    for row in range(10, 11):
+        for col in range(6, 8):  # F~G
+            cell = ws.cell(row=row, column=col)
+            cell.alignment = Alignment(horizontal="right", vertical="center")
+            cell.font = Font(bold=True, size=10, color="4A86E8")  # (약간의 파랑)
+
+    # ----------------------------------------------------------
+    # 4) "1) 음원 서비스별 정산내역" 테이블
+    #    - 헤더 배경색
+    #    - 합계행 병합
+    #    - 중간 줄무늬 banding (원한다면)
+    #    - dotted 테두리
+    # ----------------------------------------------------------
+    # (a) 헤더(예: row_start_service)
+    header_bg = PatternFill("solid", fgColor="4CD9E0")  # (r=0.3, g=0.82, b=0.88 근사)
+    for col in range(2, 8):  # B~G
+        cell = ws.cell(row=row_start_service, column=col)
+        cell.fill = header_bg
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # (b) 합계행 (예: row_sum_service)
+    #    "mergeCells"로 B~F 합치고 G만 따로
+    ws.merge_cells(start_row=row_sum_service, start_column=2,
+                   end_row=row_sum_service, end_column=6)
+    for col in range(2, 7):
+        cell = ws.cell(row=row_sum_service, column=col)
+        cell.fill = PatternFill("solid", fgColor="E5FCFF")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    cell_g = ws.cell(row=row_sum_service, column=7)
+    cell_g.fill = PatternFill("solid", fgColor="E5FCFF")
+    cell_g.font = Font(bold=True)
+    cell_g.alignment = Alignment(horizontal="center", vertical="center")
+
+    # (c) 테두리 dotted
+    dotted_side = Side(border_style="dotted", color="000000")
+    for r in range(row_start_service+1, row_sum_service):  # 데이터 구간
+        for c in range(2, 8):
+            cell = ws.cell(row=r, column=c)
+            cell.border = Border(top=dotted_side, left=dotted_side,
+                                 right=dotted_side, bottom=dotted_side)
+
+    # 합계행도 dotted
+    for c in range(2, 8):
+        cell = ws.cell(row=row_sum_service, column=c)
+        cell.border = Border(top=dotted_side, left=dotted_side,
+                             right=dotted_side, bottom=dotted_side)
+
+    # ----------------------------------------------------------
+    # 5) "2) 앨범 별 정산 내역" 테이블 (row_start_album ~ row_sum_album)
+    #    (헤더 색상, 합계행 병합, dotted 테두리 등) → 위와 유사
+    # ----------------------------------------------------------
+    # 헤더
+    for col in range(2, 8):
+        cell = ws.cell(row=row_start_album, column=col)
+        cell.fill = header_bg
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # 합계행
+    ws.merge_cells(start_row=row_sum_album, start_column=2,
+                   end_row=row_sum_album, end_column=6)
+    for col in range(2, 7):
+        cell = ws.cell(row=row_sum_album, column=col)
+        cell.fill = PatternFill("solid", fgColor="E5FCFF")
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.cell(row=row_sum_album, column=7).fill = PatternFill("solid", fgColor="E5FCFF")
+    ws.cell(row=row_sum_album, column=7).font = Font(bold=True)
+    ws.cell(row=row_sum_album, column=7).alignment = Alignment(horizontal="center")
+
+    # dotted 테두리(데이터 구간)
+    for r in range(row_start_album+1, row_sum_album+1):
+        for c in range(2, 8):
+            ws.cell(row=r, column=c).border = Border(top=dotted_side, left=dotted_side,
+                                                     right=dotted_side, bottom=dotted_side)
+
+    # ----------------------------------------------------------
+    # 6) "3) 공제 내역" (row_start_deduction ~ row_end_deduction)
+    #    헤더 / 본문 / dotted 테두리 등 동일 패턴
+    # ----------------------------------------------------------
+    # 헤더
+    for col in range(2, 8):
+        cell = ws.cell(row=row_start_deduction, column=col)
+        cell.fill = header_bg
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # 데이터(= row_start_deduction+1 ~ row_end_deduction)
+    for r in range(row_start_deduction+1, row_end_deduction+1):
+        for c in range(2, 8):
+            ws.cell(row=r, column=c).border = Border(top=dotted_side, left=dotted_side,
+                                                     right=dotted_side, bottom=dotted_side)
+
+    # ----------------------------------------------------------
+    # 7) "4) 수익 배분" (row_start_rate ~ row_end_rate)
+    # ----------------------------------------------------------
+    # 헤더
+    for col in range(2, 8):
+        cell = ws.cell(row=row_start_rate, column=col)
+        cell.fill = header_bg
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # 본문
+    for r in range(row_start_rate+1, row_end_rate+1):
+        for c in range(2, 8):
+            ws.cell(row=r, column=c).border = Border(top=dotted_side, left=dotted_side,
+                                                     right=dotted_side, bottom=dotted_side)
+
+    # ----------------------------------------------------------
+    # 8) 시트 외곽( A1~H{row_total_end} ) 검정 SOLID 테두리
+    # ----------------------------------------------------------
+    solid_side = Side(border_style="thin", color="000000")
+    # 가령 row=1..row_total_end, col=1..8
+    for r in range(1, row_total_end+1):
+        for c in range(1, 9):
+            cell = ws.cell(row=r, column=c)
+            # 기존 border가 있으면 merge해야 하지만, 예시에선 overwrite
+            cell.border = Border(top=solid_side, left=solid_side,
+                                 right=solid_side, bottom=solid_side)
+
+    # 필요하다면 추가 스타일(부가세 문구, 수익 배분율 폰트색, 등)도
+    # 위와 같은 방식으로 세부 조정 가능.
+
+
+
+# --------------------------------------------------
+# 세부매출내역 스타일
+# --------------------------------------------------
+def apply_detail_sheet_style(ws, total_rows: int):
+    """
+    [세부매출내역] 시트에 대해,
+    기존 Google Sheets batchUpdate(detail_requests) 로 설정했던 스타일을
+    openpyxl로 최대한 동일하게 재현한 예시.
+
+    인자:
+    - ws: openpyxl Worksheet (이미 데이터가 쓰여 있는 상태)
+    - total_rows: 실제로 데이터가 기록된 마지막 행 번호 (헤더 + 바디 + 합계행 포함)
+
+    * 필요에 따라 row/col 개수를 조정하세요.
+    """
+
+    # ----------------------------------------------------------
+    # 1) 열 너비 설정
+    #    (예) A열 = 140px, B열=140px, E열=120px 등
+    #    openpyxl은 픽셀이 아니라 '문자열 넓이' 단위이므로 대략적인 값으로 조정 필요
+    # ----------------------------------------------------------
+    # A=1, B=2, C=3, D=4, E=5, F=6, G=7
+    # 아래는 예시로, Google Sheets에서 pixelSize=140 → 대략 20~22 정도로 설정
+    ws.column_dimensions["A"].width = 20
+    ws.column_dimensions["B"].width = 20
+    ws.column_dimensions["C"].width = 15
+    ws.column_dimensions["D"].width = 15
+    ws.column_dimensions["E"].width = 18
+    ws.column_dimensions["F"].width = 15
+    ws.column_dimensions["G"].width = 15
+
+    # ----------------------------------------------------------
+    # 2) 헤더(A1~G1) 배경색 / 폰트 / 정렬
+    #    Google Sheets: backgroundColor=(1, 0.8, 0.0) → #FFCC00(혹은 #FFC000 근사)
+    # ----------------------------------------------------------
+    header_bg = PatternFill(fill_type="solid", fgColor="FFC000")
+    header_font = Font(bold=True, color="000000")
+    for cell in ws[1]:  # 1행(헤더)
+        cell.fill = header_bg
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # ----------------------------------------------------------
+    # 3) 합계행 병합 & 스타일
+    #    원본 detail_requests에서는 마지막 행(A~F) 병합, G열만 따로 우측 정렬
+    #    예: sum_row = total_rows (마지막 행)
+    # ----------------------------------------------------------
+    sum_row = total_rows
+    # (a) A{sum_row}~F{sum_row} 병합
+    ws.merge_cells(start_row=sum_row, start_column=1, end_row=sum_row, end_column=6)
+
+    # (b) 합계행 배경색 / 폰트 / 정렬
+    for col in range(1, 7):  # A~F
+        c = ws.cell(row=sum_row, column=col)
+        c.fill = header_bg
+        c.font = Font(bold=True)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+    # G열(매출 합계금액) 오른쪽 정렬 & 굵게
+    c_g = ws.cell(row=sum_row, column=7)
+    c_g.alignment = Alignment(horizontal="right", vertical="center")
+    c_g.font = Font(bold=True)
+    c_g.fill = header_bg
+
+    # ----------------------------------------------------------
+    # 4) 매출액(7열) 오른쪽 정렬
+    #    detail_requests에서 "매출 순수익" 칼럼을 오른쪽 정렬했던 것과 동일
+    #    여기서는 2행~(합계행-1)까지 적용 예시
+    # ----------------------------------------------------------
+    for r in range(2, sum_row):
+        cell_revenue = ws.cell(row=r, column=7)
+        cell_revenue.alignment = Alignment(horizontal="right", vertical="center")
+
+    # ----------------------------------------------------------
+    # 5) 전체 테두리 (A1~G{total_rows}) SOLID 1px
+    #    Google Sheets: "updateBorders": {style:"SOLID", width=1, color:black}
+    # ----------------------------------------------------------
+    thin = Side(border_style="thin", color="000000")  # 검정 실선
+    for r in range(1, total_rows+1):
+        for c in range(1, 8):  # col=1..7
+            cell = ws.cell(row=r, column=c)
+            cell.border = Border(top=thin, left=thin, right=thin, bottom=thin)
+
+    # 필요하다면 행높이, 줄무늬 banding, 등등 추가
+    # 예) 1행 높이
+    # ws.row_dimensions[1].height = 25
+
+
+
 
 
 # --------------------------------------------------
