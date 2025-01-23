@@ -713,7 +713,7 @@ def write_detail_data(ws, detail_list, start_row=1):
     data_start = start_row + 1
     r = data_start
     for d in detail_list:
-        ws.cell(row=r, column=1, value=d.get("albumArtist", ""))
+        ws.cell(row=r, column=1, value=d.get("aartist", ""))
         ws.cell(row=r, column=2, value=d.get("album", ""))
         ws.cell(row=r, column=3, value=d.get("major", ""))
         ws.cell(row=r, column=4, value=d.get("middle", ""))
@@ -763,7 +763,7 @@ def apply_detail_style(ws, header_row, data_start, data_end, sum_row):
     for row in range(data_start, data_end+1):
         for col in range(1, 8):
             cell = ws.cell(row=row, column=col)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.alignment = Alignment(horizontal="right", vertical="center")
             cell.border = thin_border
 
     # 3) 합계행
@@ -782,6 +782,11 @@ def apply_detail_style(ws, header_row, data_start, data_end, sum_row):
             # 합계 텍스트와 금액만 색/굵게
             cell.fill = sum_fill
             cell.font = Font(bold=True)
+    # A~F 병합
+    ws.merge_cells(start_row=sum_row, start_column=1, end_row=sum_row, end_column=6)
+
+
+
 
     # (열너비 등)
     ws.column_dimensions["A"].width = 20
