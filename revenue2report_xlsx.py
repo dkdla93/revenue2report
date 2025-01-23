@@ -668,9 +668,8 @@ def create_report_excel(artist, service_list, album_list, deduction_list, rate_l
     ws.column_dimensions["G"].width = 16
     ws.column_dimensions["H"].width = 5
 
-    filename = f"{artist}_정산서.xlsx"
-    wb.save(filename)
-    return filename
+    return wb
+
 
 
 # --------------------------------------------------
