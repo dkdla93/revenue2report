@@ -30,6 +30,14 @@ def main():
     st.info("끝")
 
 
+def sanitize_sheet_title(s: str) -> str:
+    # : \ / ? * [ ]
+    bad_chars = [':','\\','/','?','*','[',']']
+    for ch in bad_chars:
+        s = s.replace(ch, '_')  # 치환
+    # 엑셀 시트명 최대 31자
+    return s[:31]
+
 # ------------------------------------------
 # 1) 섹션1: 보고서 생성(파일 업로드 + 진행기간/발행일 입력)
 # ------------------------------------------
@@ -626,7 +634,9 @@ def style_rate_table(ws, info):
 def create_report_excel(artist, service_list, album_list, deduction_list, rate_list):
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = f"{artist}(정산서)"
+    
+    safe_artist = sanitize_sheet_title(artist)
+    ws.title = f"{safe_artist}(정산서)"[:31]  # 31자 제한 고려
 
     # 1) 음원 서비스별
     row_cursor = 12
@@ -786,7 +796,9 @@ def apply_detail_style(ws, header_row, data_start, data_end, sum_row):
 def create_detail_excel(artist, ym, detail_list):
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = f"{artist}(세부매출내역)"
+    
+    safe_artist = sanitize_sheet_title(artist)
+    ws.title = f"{safe_artist}(세부매출내역)"[:31]  # 31자 제한 고려
 
     out_info = write_detail_data(ws, detail_list, start_row=1)
 
