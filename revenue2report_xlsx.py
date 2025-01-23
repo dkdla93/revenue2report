@@ -237,191 +237,460 @@ def show_detailed_verification(check_dict):
 # --------------------------------------------------
 # 정산서 스타일
 # --------------------------------------------------
-def apply_report_sheet_style(
-    ws,
-    # (1) 음원 서비스별 정산내역: 헤더행 ~ 합계행
-    row_start_service_header,
-    row_sum_service,
-    # (2) 앨범별 정산 내역
-    row_start_album_header,
-    row_sum_album,
-    # (3) 공제 내역
-    row_start_deduction_header,
-    row_end_deduction,
-    # (4) 수익 배분
-    row_start_rate_header,
-    row_end_rate,
-    # 시트 전체 범위 (외곽 테두리)
-    total_first_row, total_last_row,
-    total_first_col=1, total_last_col=8
-):
+def write_service_table(ws, start_row, service_list):
     """
-    [정산서] 시트에 banding + 병합 + 테두리 등을 적용하는 예시.
+    (1) 음원 서비스별 정산내역 작성
 
-    인자로 row 위치들을 받아, 그 범위에 맞춰 스타일 설정.
-    (각 row_* 값은 이미 1-based라 가정)
+    인자:
+      - ws: openpyxl Worksheet
+      - start_row: 섹션을 시작할 엑셀 행(1-based)
+      - service_list: [
+          {"album":..., "major":..., "middle":..., "service":..., "year":..., "month":..., "revenue":...},
+          ...
+        ]
+
+    반환:
+      dict = {
+        "section_title_row": <섹션제목 적은 행>,
+        "header_row": <헤더 행>,
+        "data_start": <데이터 시작행>,
+        "data_end":   <데이터 끝행>,
+        "sum_row":    <합계행>,
+        "next_start_row": <다음 섹션부터 쓸 행>,
+      }
+    """
+    # (A) 섹션 제목
+    section_title_row = start_row
+    ws.cell(row=section_title_row, column=2, value="1) 음원 서비스별 정산내역")
+
+    # (B) 헤더: 다음 행
+    header_row = section_title_row + 1
+    ws.cell(row=header_row, column=2, value="앨범")
+    ws.cell(row=header_row, column=3, value="대분류")
+    ws.cell(row=header_row, column=4, value="중분류")
+    ws.cell(row=header_row, column=5, value="서비스명")
+    ws.cell(row=header_row, column=6, value="기간")
+    ws.cell(row=header_row, column=7, value="매출액")
+
+    # (C) 데이터
+    data_start = header_row + 1
+    r = data_start
+    for item in service_list:
+        ws.cell(row=r, column=2, value=item.get("album",""))
+        ws.cell(row=r, column=3, value=item.get("major",""))
+        ws.cell(row=r, column=4, value=item.get("middle",""))
+        ws.cell(row=r, column=5, value=item.get("service",""))
+        year_str  = str(item.get("year","2024"))
+        month_str = str(item.get("month","12"))
+        ws.cell(row=r, column=6, value=f"{year_str}년 {month_str}월")
+        ws.cell(row=r, column=7, value=item.get("revenue",0.0))
+        r += 1
+    data_end = r - 1
+
+    # (D) 합계행
+    sum_row = data_end + 1
+    ws.cell(row=sum_row, column=2, value="합계")
+    total_val = sum(x.get("revenue",0.0) for x in service_list)
+    ws.cell(row=sum_row, column=7, value=total_val)
+
+    next_start_row = sum_row + 2  # 다음 섹션은 합계행 + 1~2행 띄우고 시작
+
+    return {
+        "section_title_row": section_title_row,
+        "header_row": header_row,
+        "data_start": data_start,
+        "data_end": data_end,
+        "sum_row": sum_row,
+        "next_start_row": next_start_row
+    }
+
+
+def style_service_table(ws, info):
+    """
+    (1) 음원 서비스별 정산내역 스타일 적용
+
+    info = {
+      "section_title_row": ...,
+      "header_row": ...,
+      "data_start": ...,
+      "data_end": ...,
+      "sum_row": ...,
+      ...
+    }
     """
 
-    # ----------------------------------------------------
-    # 공통 스타일 지정: 색상, 테두리, 폰트 등
-    # ----------------------------------------------------
-    header_bg = PatternFill("solid", fgColor="4CD9E0")  # 헤더용
-    band_color_even = "FFFFFF"  # 짝수행
-    band_color_odd  = "E5FCFF"  # 홀수행
-    dotted_side = Side(border_style="dotted", color="000000")
-    thin_side   = Side(border_style="thin", color="000000")
+    dotted_side = Side(style="dotted", color="000000")
+    header_bg = PatternFill("solid", fgColor="4CD9E0")  # 헤더
+    band_e = "FFFFFF"  # 짝수줄
+    band_o = "E5FCFF"  # 홀수줄
+    sum_fill = PatternFill("solid", fgColor="E5FCFF")
 
-    # ----------------------------------------------------
-    # 1) "음원 서비스별 정산내역" 테이블
-    #    헤더: row_start_service_header
-    #    합계: row_sum_service
-    #    본문(데이터): (row_start_service_header+1) ~ (row_sum_service-1)
-    # ----------------------------------------------------
-    # (a) 헤더
-    for c in range(2, 8):  # 예: B~G
-        cell = ws.cell(row=row_start_service_header, column=c)
+    # 섹션 헤더(제목)은 row=info["section_title_row"], col=2
+    # 원한다면 스타일 지정 가능
+    title_row = info["section_title_row"]
+    cell_title = ws.cell(row=title_row, column=2)
+    cell_title.font = Font(bold=True, size=12)
+
+    # 1) 헤더
+    hr = info["header_row"]
+    for c in range(2, 8):
+        cell = ws.cell(row=hr, column=c)
         cell.fill = header_bg
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = Border(top=dotted_side, left=dotted_side,
-                             right=dotted_side, bottom=dotted_side)
+        cell.border = Border(top=dotted_side, bottom=dotted_side,
+                             left=dotted_side, right=dotted_side)
 
-    # (b) 데이터 구간에 banding
-    data_start = row_start_service_header + 1
-    data_end   = row_sum_service - 1
-    if data_end >= data_start:
-        for r in range(data_start, data_end+1):
-            offset = r - data_start  # 0,1,2...
-            fill_color = band_color_even if (offset % 2 == 0) else band_color_odd
+    # 2) 본문 (data_start ~ data_end)
+    ds = info["data_start"]
+    de = info["data_end"]
+    for r in range(ds, de+1):
+        offset = r - ds
+        row_fill = band_e if (offset % 2 == 0) else band_o
+        for c in range(2, 8):
+            cell = ws.cell(row=r, column=c)
+            cell.fill = PatternFill("solid", fgColor=row_fill)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = Border(top=dotted_side, bottom=dotted_side,
+                                 left=dotted_side, right=dotted_side)
 
-            for c in range(2, 8):
-                cell = ws.cell(row=r, column=c)
-                cell.fill = PatternFill("solid", fgColor=fill_color)
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-                cell.border = Border(top=dotted_side, left=dotted_side,
-                                     right=dotted_side, bottom=dotted_side)
-
-    # (c) 합계행
-    #    예: B~F 병합, G만 따로
-    ws.merge_cells(start_row=row_sum_service, start_column=2,
-                   end_row=row_sum_service, end_column=6)
+    # 3) 합계행
+    sr = info["sum_row"]
+    # B~F 병합, G 따로
+    ws.merge_cells(start_row=sr, start_column=2, end_row=sr, end_column=6)
     for c in range(2, 7):
-        cell = ws.cell(row=row_sum_service, column=c)
-        cell.fill = PatternFill("solid", fgColor="E5FCFF")
+        cell = ws.cell(row=sr, column=c)
+        cell.fill = sum_fill
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = Border(top=dotted_side, left=dotted_side,
-                             right=dotted_side, bottom=dotted_side)
+        cell.border = Border(top=dotted_side, bottom=dotted_side,
+                             left=dotted_side, right=dotted_side)
 
-    cell_g = ws.cell(row=row_sum_service, column=7)
-    cell_g.fill = PatternFill("solid", fgColor="E5FCFF")
+    cell_g = ws.cell(row=sr, column=7)
+    cell_g.fill = sum_fill
     cell_g.font = Font(bold=True)
     cell_g.alignment = Alignment(horizontal="center", vertical="center")
-    cell_g.border = Border(top=dotted_side, left=dotted_side,
-                           right=dotted_side, bottom=dotted_side)
+    cell_g.border = Border(top=dotted_side, bottom=dotted_side,
+                           left=dotted_side, right=dotted_side)
 
-    # ----------------------------------------------------
-    # 2) 앨범별 정산 (row_start_album_header ~ row_sum_album)
-    #    동일 패턴 (헤더→데이터→합계)
-    # ----------------------------------------------------
+
+def write_album_table(ws, start_row, album_list):
+    """
+    (2) 앨범별 정산 내역
+    album_list: [{"album":..., "revenue":..., "year":..., "month":...}, ...]
+
+    동일 패턴: 헤더 -> 데이터 -> 합계
+    """
+    section_title_row = start_row
+    ws.cell(row=section_title_row, column=2, value="2) 앨범별 정산 내역")
+
+    header_row = section_title_row + 1
+    ws.cell(row=header_row, column=2, value="앨범")
+    ws.cell(row=header_row, column=6, value="기간")
+    ws.cell(row=header_row, column=7, value="매출액")
+
+    data_start = header_row + 1
+    r = data_start
+    for alb in album_list:
+        ws.cell(row=r, column=2, value=alb.get("album",""))
+        y = str(alb.get("year","2024"))
+        m = str(alb.get("month","12"))
+        ws.cell(row=r, column=6, value=f"{y}년 {m}월")
+        ws.cell(row=r, column=7, value=alb.get("revenue", 0.0))
+        r += 1
+    data_end = r - 1
+
+    sum_row = data_end + 1
+    ws.cell(row=sum_row, column=2, value="합계")
+    total_val = sum(x.get("revenue",0.0) for x in album_list)
+    ws.cell(row=sum_row, column=7, value=total_val)
+
+    next_start_row = sum_row + 2
+
+    return {
+        "section_title_row": section_title_row,
+        "header_row": header_row,
+        "data_start": data_start,
+        "data_end": data_end,
+        "sum_row": sum_row,
+        "next_start_row": next_start_row
+    }
+
+
+def style_album_table(ws, info):
+    """
+    (2) 앨범별 정산 내역 스타일
+    """
+
+    dotted_side = Side(style="dotted", color="000000")
+    header_bg = PatternFill("solid", fgColor="4CD9E0")
+    band_e = "FFFFFF"
+    band_o = "E5FCFF"
+    sum_fill = PatternFill("solid", fgColor="E5FCFF")
+
+    # 섹션 제목
+    cell_title = ws.cell(row=info["section_title_row"], column=2)
+    cell_title.font = Font(bold=True, size=12)
+
     # 헤더
-    for c in range(2, 8):
-        cell = ws.cell(row=row_start_album_header, column=c)
+    hr = info["header_row"]
+    for c in [2,6,7]:
+        cell = ws.cell(row=hr, column=c)
         cell.fill = header_bg
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = Border(top=dotted_side, left=dotted_side,
-                             right=dotted_side, bottom=dotted_side)
-
-    data_start_alb = row_start_album_header + 1
-    data_end_alb   = row_sum_album - 1
-    if data_end_alb >= data_start_alb:
-        for r in range(data_start_alb, data_end_alb+1):
-            offset = r - data_start_alb
-            fill_color = band_color_even if (offset % 2 == 0) else band_color_odd
-            for c in range(2, 8):
-                ws.cell(row=r, column=c).fill = PatternFill("solid", fgColor=fill_color)
-                ws.cell(row=r, column=c).font = Font(bold=False)
-                ws.cell(row=r, column=c).alignment = Alignment(horizontal="center")
-                ws.cell(row=r, column=c).border = Border(top=dotted_side, left=dotted_side,
-                                                         right=dotted_side, bottom=dotted_side)
-
-    # 합계행
-    ws.merge_cells(start_row=row_sum_album, start_column=2,
-                   end_row=row_sum_album, end_column=6)
-    for c in range(2, 7):
-        cell = ws.cell(row=row_sum_album, column=c)
-        cell.fill = PatternFill("solid", fgColor="E5FCFF")
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = Border(top=dotted_side, left=dotted_side,
-                             right=dotted_side, bottom=dotted_side)
-
-    cell_g2 = ws.cell(row=row_sum_album, column=7)
-    cell_g2.fill = PatternFill("solid", fgColor="E5FCFF")
-    cell_g2.font = Font(bold=True)
-    cell_g2.alignment = Alignment(horizontal="center", vertical="center")
-    cell_g2.border = Border(top=dotted_side, left=dotted_side,
-                            right=dotted_side, bottom=dotted_side)
-
-    # ----------------------------------------------------
-    # 3) 공제 내역 (헤더+데이터)
-    # ----------------------------------------------------
-    # 헤더
-    for c in range(2, 8):
-        cell = ws.cell(row=row_start_deduction_header, column=c)
-        cell.fill = header_bg
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = Border(top=dotted_side, left=dotted_side,
-                             right=dotted_side, bottom=dotted_side)
+        cell.border = Border(left=dotted_side, right=dotted_side,
+                             top=dotted_side, bottom=dotted_side)
 
     # 데이터
-    ded_data_start = row_start_deduction_header + 1
-    if row_end_deduction >= ded_data_start:
-        for r in range(ded_data_start, row_end_deduction+1):
-            offset = r - ded_data_start
-            fill_color = band_color_even if (offset % 2 == 0) else band_color_odd
-            for c in range(2, 8):
-                ws.cell(row=r, column=c).fill = PatternFill("solid", fgColor=fill_color)
-                ws.cell(row=r, column=c).alignment = Alignment(horizontal="center")
-                ws.cell(row=r, column=c).border = Border(top=dotted_side, left=dotted_side,
-                                                         right=dotted_side, bottom=dotted_side)
+    ds = info["data_start"]
+    de = info["data_end"]
+    for r in range(ds, de+1):
+        offset = r - ds
+        row_fill = band_e if (offset % 2 == 0) else band_o
 
-    # ----------------------------------------------------
-    # 4) 수익 배분 (헤더+데이터)
-    # ----------------------------------------------------
-    for c in range(2, 8):
-        cell = ws.cell(row=row_start_rate_header, column=c)
+        for c in [2,6,7]:
+            cell = ws.cell(row=r, column=c)
+            cell.fill = PatternFill("solid", fgColor=row_fill)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = Border(left=dotted_side, right=dotted_side,
+                                 top=dotted_side, bottom=dotted_side)
+
+    # 합계행
+    sr = info["sum_row"]
+    # B~F 병합? -> 여기선 B6~B6..(?) 구조가 다르므로
+    # 예시로 "B~F" 대신 "B~F"는 사실 안 쓰는 컬럼이 있을 수 있음
+    ws.merge_cells(start_row=sr, start_column=2, end_row=sr, end_column=6)
+    for c in range(2, 7):
+        cell = ws.cell(row=sr, column=c)
+        cell.fill = sum_fill
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+        cell.border = Border(left=dotted_side, right=dotted_side,
+                             top=dotted_side, bottom=dotted_side)
+
+    cell_g = ws.cell(row=sr, column=7)
+    cell_g.fill = sum_fill
+    cell_g.font = Font(bold=True)
+    cell_g.alignment = Alignment(horizontal="center")
+    cell_g.border = Border(left=dotted_side, right=dotted_side,
+                           top=dotted_side, bottom=dotted_side)
+
+def write_deduction_table(ws, start_row, ded_list):
+    """
+    (3) 공제 내역
+    ded_list: [{"album":..., "prev_cost":..., "deduct_cost":..., "remain_cost":..., "after_deduct":...}, ...]
+      - 예: 전월잔액 / 당월차감액 / 당월잔액 / 공제 적용 금액 등...
+    """
+    section_title_row = start_row
+    ws.cell(row=section_title_row, column=2, value="3) 공제 내역")
+
+    header_row = section_title_row + 1
+    ws.cell(row=header_row, column=2, value="앨범")
+    ws.cell(row=header_row, column=3, value="곡비")
+    ws.cell(row=header_row, column=4, value="공제 금액")
+    ws.cell(row=header_row, column=6, value="공제 후 남은 곡비")
+    ws.cell(row=header_row, column=7, value="공제 적용 금액")
+
+    data_start = header_row + 1
+    r = data_start
+    for d in ded_list:
+        ws.cell(row=r, column=2, value=d.get("album",""))
+        ws.cell(row=r, column=3, value=d.get("prev_cost",0.0))
+        ws.cell(row=r, column=4, value=d.get("deduct_cost",0.0))
+        ws.cell(row=r, column=6, value=d.get("remain_cost",0.0))
+        ws.cell(row=r, column=7, value=d.get("after_deduct",0.0))
+        r += 1
+    data_end = r - 1
+
+    # 합계행? 필요하면 추가
+    # 여기서는 예시로 "합계"는 쓰지 않고 그냥 data_end까지만
+    sum_row = data_end  # or None if no sum
+
+    next_start_row = data_end + 2
+
+    return {
+        "section_title_row": section_title_row,
+        "header_row": header_row,
+        "data_start": data_start,
+        "data_end": data_end,
+        "sum_row": sum_row,
+        "next_start_row": next_start_row
+    }
+
+def style_deduction_table(ws, info):
+
+    dotted_side = Side(style="dotted", color="000000")
+    header_bg = PatternFill("solid", fgColor="4CD9E0")
+    band_e = "FFFFFF"
+    band_o = "E5FCFF"
+
+    # 제목
+    ws.cell(row=info["section_title_row"], column=2).font = Font(bold=True, size=12)
+
+    hr = info["header_row"]
+    for c in [2,3,4,6,7]:
+        cell = ws.cell(row=hr, column=c)
         cell.fill = header_bg
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = Border(top=dotted_side, left=dotted_side,
-                             right=dotted_side, bottom=dotted_side)
+        cell.border = Border(left=dotted_side, right=dotted_side,
+                             top=dotted_side, bottom=dotted_side)
 
-    rate_data_start = row_start_rate_header + 1
-    if row_end_rate >= rate_data_start:
-        for r in range(rate_data_start, row_end_rate+1):
-            offset = r - rate_data_start
-            fill_color = band_color_even if (offset % 2 == 0) else band_color_odd
-            for c in range(2, 8):
-                ws.cell(row=r, column=c).fill = PatternFill("solid", fgColor=fill_color)
-                ws.cell(row=r, column=c).alignment = Alignment(horizontal="center")
-                ws.cell(row=r, column=c).border = Border(top=dotted_side, left=dotted_side,
-                                                         right=dotted_side, bottom=dotted_side)
+    ds = info["data_start"]
+    de = info["data_end"]
+    for r in range(ds, de+1):
+        offset = r - ds
+        row_fill = band_e if (offset % 2 == 0) else band_o
+        for c in [2,3,4,5,6,7]:
+            cell = ws.cell(row=r, column=c)
+            cell.fill = PatternFill("solid", fgColor=row_fill)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = Border(left=dotted_side, right=dotted_side,
+                                 top=dotted_side, bottom=dotted_side)
 
-    # ----------------------------------------------------
-    # 5) 시트 외곽 (A~H, row=1..row_total_end) 에 얇은 검정 실선
-    # ----------------------------------------------------
-    for r in range(total_first_row, total_last_row+1):
-        for c in range(total_first_col, total_last_col+1):
-            # 기존 dotted가 있더라도, 여기서 덮어쓰게 됨
-            # 필요하면 merge해서 쓰거나, 그냥 덮어써도 무방
-            ws.cell(row=r, column=c).border = Border(
-                top=thin_side, left=thin_side, right=thin_side, bottom=thin_side
+def write_rate_table(ws, start_row, rate_list):
+    """
+    (4) 수익 배분
+    rate_list: [{"album":..., "rate":..., "applied_amount":..., ...}, ...]
+    + "총 정산금액" 등도 작성
+    """
+    section_title_row = start_row
+    ws.cell(row=section_title_row, column=2, value="4) 수익 배분")
+
+    header_row = section_title_row + 1
+    ws.cell(row=header_row, column=2, value="앨범")
+    ws.cell(row=header_row, column=3, value="항목")
+    ws.cell(row=header_row, column=4, value="적용율")
+    ws.cell(row=header_row, column=7, value="적용 금액")
+
+    data_start = header_row + 1
+    r = data_start
+    for d in rate_list:
+        ws.cell(row=r, column=2, value=d.get("album",""))
+        ws.cell(row=r, column=3, value="수익 배분율")
+        ws.cell(row=r, column=4, value=f"{d.get('rate',0)}%")
+        ws.cell(row=r, column=7, value=d.get("applied_amount", 0.0))
+        r += 1
+    data_end = r - 1
+
+    # 마지막에 "총 정산금액" 표시
+    sum_row = data_end + 1
+    ws.cell(row=sum_row, column=2, value="총 정산금액")
+    total_val = sum(x.get("applied_amount",0.0) for x in rate_list)
+    ws.cell(row=sum_row, column=7, value=total_val)
+
+    next_start_row = sum_row + 2
+
+    return {
+        "section_title_row": section_title_row,
+        "header_row": header_row,
+        "data_start": data_start,
+        "data_end": data_end,
+        "sum_row": sum_row,
+        "next_start_row": next_start_row
+    }
+
+def style_rate_table(ws, info):
+
+    dotted_side = Side(style="dotted", color="000000")
+    header_bg = PatternFill("solid", fgColor="4CD9E0")
+    band_e = "FFFFFF"
+    band_o = "E5FCFF"
+    sum_fill = PatternFill("solid", fgColor="E5FCFF")
+
+    ws.cell(row=info["section_title_row"], column=2).font = Font(bold=True, size=12)
+
+    hr = info["header_row"]
+    for c in [2,3,4,7]:
+        cell = ws.cell(row=hr, column=c)
+        cell.fill = header_bg
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+        cell.border = Border(left=dotted_side, right=dotted_side,
+                             top=dotted_side, bottom=dotted_side)
+
+    ds = info["data_start"]
+    de = info["data_end"]
+    for r in range(ds, de+1):
+        offset = r - ds
+        row_fill = band_e if (offset % 2 == 0) else band_o
+        for c in [2,3,4,5,6,7]:
+            cell = ws.cell(row=r, column=c)
+            cell.fill = PatternFill("solid", fgColor=row_fill)
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = Border(left=dotted_side, right=dotted_side,
+                                 top=dotted_side, bottom=dotted_side)
+
+    # 합계행
+    sr = info["sum_row"]
+    ws.merge_cells(start_row=sr, start_column=2, end_row=sr, end_column=6)
+    for c in range(2, 7):
+        cell = ws.cell(row=sr, column=c)
+        cell.fill = sum_fill
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+        cell.border = Border(left=dotted_side, right=dotted_side,
+                             top=dotted_side, bottom=dotted_side)
+
+    cell_g = ws.cell(row=sr, column=7)
+    cell_g.fill = sum_fill
+    cell_g.font = Font(bold=True)
+    cell_g.alignment = Alignment(horizontal="center")
+    cell_g.border = Border(left=dotted_side, right=dotted_side,
+                           top=dotted_side, bottom=dotted_side)
+
+
+def create_report_excel(artist, service_list, album_list, deduction_list, rate_list):
+    """
+    아티스트별 정산서 엑셀을 생성:
+      1) 음원 서비스별 (write_service_table + style_service_table)
+      2) 앨범별 (write_album_table + style_album_table)
+      3) 공제 내역 (write_deduction_table + style_deduction_table)
+      4) 수익 배분 (write_rate_table + style_rate_table)
+
+    service_list, album_list, deduction_list, rate_list 는
+    각각 dict 목록이며, 위의 write_XXX 함수에서 쓰이는 구조로 맞추면 됨.
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"{artist}(정산서)"
+
+    # (1) 음원 서비스별
+    row_cursor = 12  # 예시로 12행부터 시작
+    info_service = write_service_table(ws, row_cursor, service_list)
+    style_service_table(ws, info_service)
+    row_cursor = info_service["next_start_row"]
+
+    # (2) 앨범별
+    info_album = write_album_table(ws, row_cursor, album_list)
+    style_album_table(ws, info_album)
+    row_cursor = info_album["next_start_row"]
+
+    # (3) 공제 내역
+    info_ded = write_deduction_table(ws, row_cursor, deduction_list)
+    style_deduction_table(ws, info_ded)
+    row_cursor = info_ded["next_start_row"]
+
+    # (4) 수익 배분
+    info_rate = write_rate_table(ws, row_cursor, rate_list)
+    style_rate_table(ws, info_rate)
+    row_cursor = info_rate["next_start_row"]
+
+    # 시트 외곽 테두리, 열너비, 기타
+    from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+    thin_side = Side(style="thin", color="000000")
+    # 대충 row=1..(row_cursor+10), col=1..8
+    for r in range(1, row_cursor+10):
+        for c in range(1, 9):
+            cell = ws.cell(row=r, column=c)
+            # 이미 dotted인 부분이 있어도 덮어쓸 수 있음
+            cell.border = Border(
+                top=thin_side, left=thin_side,
+                right=thin_side, bottom=thin_side
             )
 
-    # 예: 열너비
+    # 열너비
     ws.column_dimensions["A"].width = 5
     ws.column_dimensions["B"].width = 25
     ws.column_dimensions["C"].width = 16
@@ -431,64 +700,147 @@ def apply_report_sheet_style(
     ws.column_dimensions["G"].width = 16
     ws.column_dimensions["H"].width = 5
 
+    # 최종 저장
+    filename = f"{artist}_정산서.xlsx"
+    wb.save(filename)
+
+    return filename
 
 
 
 # --------------------------------------------------
-# 세부매출내역 스타일
+# 세부매출내역 데이터 및 스타일
 # --------------------------------------------------
-def apply_detail_sheet_style(ws, first_row, last_row, first_col, last_col):
+def write_detail_data(ws, detail_list, start_row=1):
     """
-    [세부매출내역] 시트용 스타일:
-      - '전체 테두리'를 검정 실선으로 적용
-      - 헤더/합계행은 필요 시 별도 처리 가능 (아래 예시)
+    세부매출내역 시트에 'detail_list' 데이터를 써넣고,
+    헤더/본문/합계행의 "행 번호"를 반환.
 
-    인자:
-      - ws: openpyxl Worksheet
-      - first_row, last_row: 실제 데이터가 있는 행 범위(1-based)
-      - first_col, last_col: 실제 데이터가 있는 열 범위(1-based)
+    detail_list: [{"albumArtist":..., "album":..., "major":..., "middle":..., "service":..., "revenue":...}, ...]
+
+    반환 예시:
+      {
+        "header_row": 1,
+        "data_start": 2,
+        "data_end": 8,
+        "sum_row": 9,
+      }
+    """
+    # 1) 헤더 (start_row에 작성)
+    ws.cell(row=start_row, column=1, value="앨범아티스트")
+    ws.cell(row=start_row, column=2, value="앨범명")
+    ws.cell(row=start_row, column=3, value="대분류")
+    ws.cell(row=start_row, column=4, value="중분류")
+    ws.cell(row=start_row, column=5, value="서비스명")
+    ws.cell(row=start_row, column=6, value="기간")
+    ws.cell(row=start_row, column=7, value="매출 순수익")
+
+    # 2) 본문
+    data_start = start_row + 1
+    r = data_start
+    for d in detail_list:
+        ws.cell(row=r, column=1, value=d.get("albumArtist", ""))
+        ws.cell(row=r, column=2, value=d.get("album", ""))
+        ws.cell(row=r, column=3, value=d.get("major", ""))
+        ws.cell(row=r, column=4, value=d.get("middle", ""))
+        ws.cell(row=r, column=5, value=d.get("service", ""))
+        ws.cell(row=r, column=6, value=f"{d.get('year','2024')}년 {d.get('month','12')}월")
+        ws.cell(row=r, column=7, value=d.get("revenue", 0.0))
+        r += 1
+    data_end = r - 1  # 실제 마지막 데이터 행
+
+    # 3) 합계행
+    sum_row = data_end + 1
+    ws.cell(row=sum_row, column=1, value="합계")
+    # (단일 셀에 "합계" 쓰고, 7번 칸에 total)
+    total_val = sum(d["revenue"] for d in detail_list)
+    ws.cell(row=sum_row, column=7, value=total_val)
+
+    return {
+        "header_row": start_row,
+        "data_start": data_start,
+        "data_end": data_end,
+        "sum_row": sum_row
+    }
+
+
+def apply_detail_style(ws, header_row, data_start, data_end, sum_row):
+    """
+    세부매출내역: 
+      - 헤더 행: 주황(또는 노랑) 배경 + 굵은폰트
+      - 본문(데이터): 검정 실선 테두리
+      - 합계행: 연한 노랑 배경 + 굵은폰트
+      - 전체 테두리는 thin(검정 실선)
     """
 
-    thin_side = Side(style="thin", color="000000")  # 검정 실선
+    thin_side = Side(style="thin", color="000000")
+    thin_border = Border(top=thin_side, left=thin_side, right=thin_side, bottom=thin_side)
 
-    # 예) 헤더 행이 있다면, 그 행에만 특별히 다른 색 적용
-    # 여기서는 "맨 첫 행"을 헤더로 가정
+    # 1) 헤더 행
     header_fill = PatternFill("solid", fgColor="FFC000")
-    header_font = Font(bold=True)
-
-    # 1) 헤더 스타일(예: first_row == 1)
-    for col in range(first_col, last_col+1):
-        cell = ws.cell(row=first_row, column=col)
+    for col in range(1, 8):  # A~G
+        cell = ws.cell(row=header_row, column=col)
         cell.fill = header_fill
-        cell.font = header_font
+        cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = thin_border
 
-    # 2) 전체 테두리 (헤더 포함)
-    for row in range(first_row, last_row+1):
-        for col in range(first_col, last_col+1):
+    # 2) 본문 데이터 (data_start ~ data_end)
+    for row in range(data_start, data_end+1):
+        for col in range(1, 8):
             cell = ws.cell(row=row, column=col)
-            cell.border = Border(top=thin_side, left=thin_side,
-                                 right=thin_side, bottom=thin_side)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = thin_border
 
-    # 3) 합계행이 있다면(예: last_row가 합계행), 거기에 별도 색을 줄 수도 있음
+    # 3) 합계행
     sum_fill = PatternFill("solid", fgColor="FFD966")
-    sum_font = Font(bold=True)
-    # 예: 맨 마지막 행을 합계행으로 간주
-    for col in range(first_col, last_col+1):
-        cell = ws.cell(row=last_row, column=col)
-        cell.fill = sum_fill
-        cell.font = sum_font
-        cell.alignment = Alignment(horizontal="right", vertical="center")
+    for col in range(1, 8):
+        cell = ws.cell(row=sum_row, column=col)
+        cell.border = thin_border
+        if col == 1:
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        elif col == 7:
+            cell.alignment = Alignment(horizontal="right", vertical="center")
+        else:
+            cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # 필요시 열너비 등도 지정
-    # 예) A~G까지 사용할 때
+        if col in (1, 7):
+            # 합계 텍스트와 금액만 색/굵게
+            cell.fill = sum_fill
+            cell.font = Font(bold=True)
+
+    # (열너비 등)
     ws.column_dimensions["A"].width = 20
     ws.column_dimensions["B"].width = 20
     ws.column_dimensions["C"].width = 15
     ws.column_dimensions["D"].width = 15
-    ws.column_dimensions["E"].width = 18
+    ws.column_dimensions["E"].width = 15
     ws.column_dimensions["F"].width = 15
     ws.column_dimensions["G"].width = 15
+
+
+def create_detail_excel(artist, detail_list):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"{artist}(세부매출내역)"
+
+    # 1) 데이터 작성
+    out_info = write_detail_data(ws, detail_list, start_row=1)
+    # => out_info = {"header_row":1, "data_start":2, "data_end":N, "sum_row":N+1, ...}
+
+    # 2) 스타일 적용
+    apply_detail_style(
+        ws,
+        header_row=out_info["header_row"],
+        data_start=out_info["data_start"],
+        data_end=out_info["data_end"],
+        sum_row=out_info["sum_row"]
+    )
+
+    # 3) 저장 (데모용)
+    filename = f"{artist}_세부매출.xlsx"
+    wb.save(filename)
+    return filename
 
 
 
